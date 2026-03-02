@@ -1,0 +1,2 @@
+"""Traffic monitoring system package."""
+
