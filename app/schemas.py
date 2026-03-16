@@ -49,3 +49,14 @@ class AnalysisPoint(BaseModel):
 class DataTimeRange(BaseModel):
     min_timestamp: datetime
     max_timestamp: datetime
+
+
+class RoutePoint(BaseModel):
+    longitude: float
+    latitude: float
+
+
+class DirectionRoute(BaseModel):
+    site_name: str
+    direction: str
+    path: List[RoutePoint]

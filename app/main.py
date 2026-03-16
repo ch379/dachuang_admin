@@ -9,6 +9,7 @@ from app.db import get_db, init_db
 from app.schemas import (
     AnalysisPoint,
     DataTimeRange,
+    DirectionRoute,
     IntersectionPoint,
     PredictionRecord,
     PublicConfig,
@@ -18,6 +19,7 @@ from app.schemas import (
 from app.service import (
     get_analysis_data,
     get_data_time_range,
+    get_direction_routes,
     get_prediction_data,
     get_traffic_data,
     get_weather,
@@ -136,3 +138,8 @@ def data_range(db: Session = Depends(get_db)) -> DataTimeRange:
         return get_data_time_range(db)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/direction-routes", response_model=List[DirectionRoute])
+def direction_routes() -> List[DirectionRoute]:
+    return get_direction_routes()
