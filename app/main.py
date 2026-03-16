@@ -11,6 +11,9 @@ from app.schemas import (
     DataTimeRange,
     DirectionRoute,
     IntersectionPoint,
+    PredictionCompareSummary,
+    PredictionMeta,
+    PredictionOption,
     PredictionRecord,
     PublicConfig,
     TrafficRecord,
@@ -21,8 +24,11 @@ from app.service import (
     get_data_time_range,
     get_direction_routes,
     get_prediction_data,
+    get_prediction_meta,
+    get_prediction_compare,
     get_traffic_data,
     get_weather,
+    list_prediction_options,
     list_intersections,
 )
 
@@ -91,10 +97,34 @@ def traffic(
 def prediction(
     time_range: Optional[str] = Query(default=None, description="YYYY-MM-DD HH:MM[:SS]"),
     road_name: Optional[str] = Query(default=None),
+    direction: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ) -> List[PredictionRecord]:
     try:
-        return get_prediction_data(db=db, time_range=time_range, road_name=road_name)
+        return get_prediction_data(db=db, time_range=time_range, road_name=road_name, direction=direction)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/prediction/meta", response_model=PredictionMeta)
+def prediction_meta() -> PredictionMeta:
+    return PredictionMeta(**get_prediction_meta())
+
+
+@app.get("/api/prediction/options", response_model=List[PredictionOption])
+def prediction_options(db: Session = Depends(get_db)) -> List[PredictionOption]:
+    return list_prediction_options(db)
+
+
+@app.get("/api/prediction/compare", response_model=PredictionCompareSummary)
+def prediction_compare(
+    time_range: str = Query(description="YYYY-MM-DD HH:MM[:SS]"),
+    road_name: str = Query(),
+    direction: str = Query(),
+    db: Session = Depends(get_db),
+) -> PredictionCompareSummary:
+    try:
+        return get_prediction_compare(db=db, time_range=time_range, road_name=road_name, direction=direction)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

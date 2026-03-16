@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,39 @@ class PredictionRecord(BaseModel):
     site_name: str
     approach: str
     predicted_vehicle_count: int = Field(ge=0)
+
+
+class PredictionMeta(BaseModel):
+    model_name: str
+    model_type: str
+    valid_mae: Optional[float] = None
+    test_mae: Optional[float] = None
+    valid_rmse: Optional[float] = None
+    test_rmse: Optional[float] = None
+    valid_mape: Optional[float] = None
+    test_mape: Optional[float] = None
+    lookback_steps: Optional[int] = None
+    forecast_steps: Optional[int] = None
+    status: str = "ready"
+
+
+class PredictionOption(BaseModel):
+    site_name: str
+    directions: List[str]
+
+
+class PredictionComparePoint(BaseModel):
+    timestamp: datetime
+    predicted_vehicle_count: int = Field(ge=0)
+    actual_vehicle_count: int = Field(ge=0)
+    abs_error: int = Field(ge=0)
+
+
+class PredictionCompareSummary(BaseModel):
+    mae: float = Field(ge=0)
+    rmse: float = Field(ge=0)
+    mape: float = Field(ge=0)
+    points: List[PredictionComparePoint]
 
 
 class WeatherData(BaseModel):

@@ -1,0 +1,2 @@
+# Use a separate Python 3.11/3.12 environment for TensorFlow training.
+tensorflow-cpu==2.19.0

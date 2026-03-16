@@ -12,10 +12,21 @@ dachuang/
 │  ├─ models.py
 │  ├─ schemas.py
 │  └─ service.py
+├─ artifacts/
+├─ ml/
+│  ├─ __init__.py
+│  ├─ baselines.py
+│  ├─ dataset.py
+│  ├─ features.py
+│  ├─ inference.py
+│  └─ lstm_model.py
 ├─ scripts/
+│  ├─ train_baseline.py
+│  ├─ train_lstm.py
 │  └─ import_traffic_excel.py
 ├─ .env.example
 ├─ requirements.txt
+├─ requirements-ml.txt
 ├─ traffic_turning_5min.xlsx
 ├─ UI设计.md
 ├─ 细节分析.md
@@ -49,6 +60,33 @@ python scripts/import_traffic_excel.py --excel traffic_turning_5min.xlsx --trunc
 ```powershell
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
+
+5. 训练预测基线模型
+
+```powershell
+pip install -r requirements.txt
+python scripts/train_baseline.py
+```
+
+6. 可选：训练 LSTM
+
+```powershell
+pip install -r requirements-ml.txt
+python scripts/train_lstm.py
+```
+
+说明：
+- 当前这台环境是 `Python 3.13`，TensorFlow LSTM 训练通常需要单独使用 `Python 3.11` 或 `Python 3.12` 虚拟环境。
+- 因此当前在线预测默认先使用基线最佳模型，LSTM 作为对比模型单独训练。
+
+推荐流程：
+
+```powershell
+.\scripts\setup_lstm_env.ps1 -PythonVersion 3.11
+.\scripts\run_lstm_compare.ps1 -PythonVersion 3.11
+```
+
+如果本机还没有 Python 3.11/3.12，请先安装对应版本，再执行上述脚本。
 
 ## 2.1 一键启动（推荐）
 
@@ -124,4 +162,4 @@ GET /api/weather?time_range=2026-03-01 08:05:00
 - `traffic_turning_5min.xlsx` 会导入到 `traffic_data` 表。
 - `GET /api/traffic` 直接查库返回真实数据。
 - `GET /api/weather` 按条件聚合库中的天气数据。
-- `GET /api/prediction` 基于历史窗口做简易预测。
+- `GET /api/prediction` 现按 `road_name + direction` 返回未来 1 小时的 6 个 10 分钟预测点。

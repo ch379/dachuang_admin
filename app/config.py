@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Tuple
 
 from pydantic import Field
@@ -28,6 +29,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./traffic.db"
     database_password: str = "traffic_password"
     redis_url: str = "redis://127.0.0.1:6379/0"
+    model_artifact_dir: str = "artifacts"
+    best_model_metadata: str = "artifacts/best_model.json"
 
     cors_allow_origins: str = "*"
 
@@ -43,6 +46,14 @@ class Settings(BaseSettings):
     @property
     def effective_amap_js_key(self) -> str:
         return self.amap_js_api_key or self.amap_api_key
+
+    @property
+    def artifact_dir_path(self) -> Path:
+        return Path(self.model_artifact_dir)
+
+    @property
+    def best_model_metadata_path(self) -> Path:
+        return Path(self.best_model_metadata)
 
 
 @lru_cache(maxsize=1)

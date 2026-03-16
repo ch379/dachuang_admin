@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
-from statistics import mean
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -17,11 +16,16 @@ from app.schemas import (
     DataTimeRange,
     DirectionRoute,
     IntersectionPoint,
+    PredictionComparePoint,
+    PredictionCompareSummary,
+    PredictionOption,
     PredictionRecord,
     RoutePoint,
     TrafficRecord,
     WeatherData,
 )
+from ml.inference import predict_next_hour
+from ml.inference import get_prediction_metadata as load_prediction_metadata
 
 
 def normalize_ts(time_range: Optional[str]) -> Optional[datetime]:
@@ -371,40 +375,118 @@ def get_prediction_data(
     db: Session,
     time_range: Optional[str],
     road_name: Optional[str],
+    direction: Optional[str],
 ) -> List[PredictionRecord]:
-    ts = normalize_ts(time_range) or datetime.now().replace(second=0, microsecond=0)
-    target_sites = [road_name] if road_name else db.execute(
-        select(TrafficData.site_name).distinct()
-    ).scalars().all()
+    ts = normalize_ts(time_range)
+    road_name = _normalize_road_name(road_name)
+    if not road_name:
+        raise ValueError("road_name is required for prediction.")
+    if not direction:
+        raise ValueError("direction is required for prediction.")
 
-    records: List[PredictionRecord] = []
-    for site in target_sites:
-        history_stmt = (
-            select(TrafficData.vehicle_count, TrafficData.approach)
-            .where(TrafficData.site_name == site)
-            .where(TrafficData.timestamp <= ts)
-            .order_by(TrafficData.timestamp.desc())
-            .limit(24)
+    predicted = predict_next_hour(site_name=road_name, approach=direction, as_of=ts)
+    if not predicted:
+        raise ValueError("Prediction model is not ready or no history is available for this road and direction.")
+
+    return [
+        PredictionRecord(
+            timestamp=timestamp,
+            site_name=road_name,
+            approach=direction,
+            predicted_vehicle_count=count,
         )
-        history = db.execute(history_stmt).all()
-        if not history:
-            continue
+        for timestamp, count in predicted
+    ]
 
-        base = int(mean([item.vehicle_count for item in history]))
-        major_approach = history[0].approach
 
-        for hour_delta, factor in [(1, 1.05), (3, 1.1), (24, 0.95)]:
-            pred_count = max(0, int(base * factor))
-            records.append(
-                PredictionRecord(
-                    timestamp=ts + timedelta(hours=hour_delta),
-                    site_name=site,
-                    approach=major_approach,
-                    predicted_vehicle_count=pred_count,
-                )
+def get_prediction_meta() -> dict:
+    return load_prediction_metadata()
+
+
+def list_prediction_options(db: Session) -> List[PredictionOption]:
+    rows = db.execute(
+        select(TrafficData.site_name, TrafficData.approach)
+        .distinct()
+        .order_by(TrafficData.site_name.asc(), TrafficData.approach.asc())
+    ).all()
+    grouped: Dict[str, List[str]] = {}
+    for site_name, approach in rows:
+        grouped.setdefault(site_name, []).append(approach)
+    return [PredictionOption(site_name=site_name, directions=directions) for site_name, directions in grouped.items()]
+
+
+def get_prediction_compare(
+    db: Session,
+    time_range: str,
+    road_name: str,
+    direction: str,
+) -> PredictionCompareSummary:
+    road_name = _normalize_road_name(road_name)
+    ts = normalize_ts(time_range)
+    if not ts:
+        raise ValueError("time_range is required for prediction comparison.")
+    if not road_name or not direction:
+        raise ValueError("road_name and direction are required for prediction comparison.")
+
+    predicted = predict_next_hour(site_name=road_name, approach=direction, as_of=ts)
+    if not predicted:
+        raise ValueError("Prediction model is not ready or no history is available for this road and direction.")
+
+    future_end = predicted[-1][0]
+    rows = get_traffic_data(
+        db=db,
+        time_range=None,
+        start_time=ts.strftime("%Y-%m-%d %H:%M:%S"),
+        end_time=future_end.strftime("%Y-%m-%d %H:%M:%S"),
+        road_name=road_name,
+        direction=direction,
+        limit=5000,
+    )
+    actual_map = _aggregate_actual_prediction_window(rows)
+    points: List[PredictionComparePoint] = []
+    actual_values: List[float] = []
+    predicted_values: List[float] = []
+
+    for timestamp, predicted_count in predicted:
+        actual_count = actual_map.get(timestamp, 0)
+        points.append(
+            PredictionComparePoint(
+                timestamp=timestamp,
+                predicted_vehicle_count=predicted_count,
+                actual_vehicle_count=actual_count,
+                abs_error=abs(predicted_count - actual_count),
             )
+        )
+        predicted_values.append(float(predicted_count))
+        actual_values.append(float(actual_count))
 
-    return records
+    mae = sum(abs(p - a) for p, a in zip(predicted_values, actual_values)) / len(points)
+    rmse = (sum((p - a) ** 2 for p, a in zip(predicted_values, actual_values)) / len(points)) ** 0.5
+    mape_terms = [abs((p - a) / (a if abs(a) > 1e-6 else 1.0)) for p, a in zip(predicted_values, actual_values)]
+    mape = sum(mape_terms) / len(mape_terms) * 100.0
+    return PredictionCompareSummary(
+        mae=round(mae, 4),
+        rmse=round(rmse, 4),
+        mape=round(mape, 4),
+        points=points,
+    )
+
+
+def _aggregate_actual_prediction_window(rows: List[TrafficRecord]) -> Dict[datetime, int]:
+    grouped: Dict[datetime, Dict[str, float]] = {}
+    for row in rows:
+        bucket_minute = (row.timestamp.minute // 10) * 10
+        bucket = row.timestamp.replace(minute=bucket_minute, second=0, microsecond=0)
+        current = grouped.get(bucket)
+        if not current:
+            current = {"sum": 0.0, "n": 0.0}
+            grouped[bucket] = current
+        current["sum"] += float(row.vehicle_count)
+        current["n"] += 1.0
+    return {
+        bucket + timedelta(minutes=10): int(round(item["sum"] / item["n"])) if item["n"] else 0
+        for bucket, item in grouped.items()
+    }
 
 
 def get_analysis_data(
