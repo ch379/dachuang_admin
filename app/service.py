@@ -6,11 +6,13 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-from sqlalchemy import Select, and_, func, select
+from sqlalchemy import Select, and_, delete, func, select
 from sqlalchemy.orm import Session
 
+from app.cache import ttl_cache
 from app.config import get_settings
-from app.models import TrafficData
+from app.db import SessionLocal
+from app.models import PredictionResult, TrafficData
 from app.schemas import (
     AnalysisPoint,
     DataTimeRange,
@@ -26,6 +28,7 @@ from app.schemas import (
 )
 from ml.inference import predict_next_hour
 from ml.inference import get_prediction_metadata as load_prediction_metadata
+from ml.dataset import load_prediction_frame
 
 
 def normalize_ts(time_range: Optional[str]) -> Optional[datetime]:
@@ -37,6 +40,13 @@ def normalize_ts(time_range: Optional[str]) -> Optional[datetime]:
         except ValueError:
             continue
     raise ValueError("time_range format should be YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]")
+
+
+def align_to_ten_minutes_floor(ts: Optional[datetime]) -> Optional[datetime]:
+    if ts is None:
+        return None
+    minute = (ts.minute // 10) * 10
+    return ts.replace(minute=minute, second=0, microsecond=0)
 
 
 def _normalize_road_name(road_name: Optional[str]) -> Optional[str]:
@@ -332,25 +342,42 @@ def get_traffic_data(
     direction: Optional[str],
     limit: int = 500,
 ) -> List[TrafficRecord]:
-    stmt = select(TrafficData)
-    stmt = _apply_filters(stmt, time_range, start_time, end_time, road_name, direction)
-    stmt = stmt.order_by(TrafficData.timestamp.desc(), TrafficData.site_name.asc()).limit(limit)
+    road_name = _normalize_road_name(road_name)
+    return _get_traffic_data_cached(time_range, start_time, end_time, road_name, direction, limit)
 
-    rows: Iterable[TrafficData] = db.execute(stmt).scalars().all()
-    return [
-        TrafficRecord(
-            timestamp=row.timestamp,
-            site_name=row.site_name,
-            approach=row.approach,
-            movement=row.movement,
-            vehicle_count=row.vehicle_count,
-            avg_speed=row.avg_speed,
-            weather=row.weather,
-            tmax=row.tmax,
-            tmin=row.tmin,
-        )
-        for row in rows
-    ]
+
+@ttl_cache(seconds=300, maxsize=512)
+def _get_traffic_data_cached(
+    time_range: Optional[str],
+    start_time: Optional[str],
+    end_time: Optional[str],
+    road_name: Optional[str],
+    direction: Optional[str],
+    limit: int,
+) -> List[TrafficRecord]:
+    db = SessionLocal()
+    try:
+        stmt = select(TrafficData)
+        stmt = _apply_filters(stmt, time_range, start_time, end_time, road_name, direction)
+        stmt = stmt.order_by(TrafficData.timestamp.desc(), TrafficData.site_name.asc()).limit(limit)
+
+        rows: Iterable[TrafficData] = db.execute(stmt).scalars().all()
+        return [
+            TrafficRecord(
+                timestamp=row.timestamp,
+                site_name=row.site_name,
+                approach=row.approach,
+                movement=row.movement,
+                vehicle_count=row.vehicle_count,
+                avg_speed=row.avg_speed,
+                weather=row.weather,
+                tmax=row.tmax,
+                tmin=row.tmin,
+            )
+            for row in rows
+        ]
+    finally:
+        db.close()
 
 
 def get_weather(db: Session, time_range: Optional[str]) -> WeatherData:
@@ -377,14 +404,19 @@ def get_prediction_data(
     road_name: Optional[str],
     direction: Optional[str],
 ) -> List[PredictionRecord]:
-    ts = normalize_ts(time_range)
+    ts = align_to_ten_minutes_floor(normalize_ts(time_range))
     road_name = _normalize_road_name(road_name)
     if not road_name:
         raise ValueError("road_name is required for prediction.")
     if not direction:
         raise ValueError("direction is required for prediction.")
 
-    predicted = predict_next_hour(site_name=road_name, approach=direction, as_of=ts)
+    predicted = _load_or_generate_prediction_rows(
+        db=db,
+        road_name=road_name,
+        direction=direction,
+        as_of=ts,
+    )
     if not predicted:
         raise ValueError("Prediction model is not ready or no history is available for this road and direction.")
 
@@ -399,16 +431,134 @@ def get_prediction_data(
     ]
 
 
+@ttl_cache(seconds=300, maxsize=512)
+def _get_prediction_data_cached(
+    road_name: str,
+    direction: str,
+    as_of_key: Optional[str],
+) -> List[Tuple[datetime, int]]:
+    ts = datetime.strptime(as_of_key, "%Y-%m-%d %H:%M:%S") if as_of_key else None
+    return predict_next_hour(site_name=road_name, approach=direction, as_of=ts)
+
+
+def _load_or_generate_prediction_rows(
+    db: Session,
+    road_name: str,
+    direction: str,
+    as_of: Optional[datetime],
+) -> List[Tuple[datetime, int]]:
+    model_type = get_prediction_meta().get("model_type", "unavailable")
+    resolved_as_of = _resolve_prediction_anchor_time(db, road_name, direction, as_of)
+    if not resolved_as_of:
+        return []
+
+    if model_type != "unavailable":
+        stored = _find_prediction_result_rows(db, road_name, direction, model_type, resolved_as_of)
+        if stored:
+            return stored
+
+    as_of_key = resolved_as_of.strftime("%Y-%m-%d %H:%M:%S")
+    predicted = _get_prediction_data_cached(road_name, direction, as_of_key)
+    if predicted and model_type != "unavailable":
+        _store_prediction_result_rows(db, road_name, direction, model_type, resolved_as_of, predicted)
+    return predicted
+
+
+def _resolve_prediction_anchor_time(
+    db: Session,
+    road_name: str,
+    direction: str,
+    as_of: Optional[datetime],
+) -> Optional[datetime]:
+    stmt = select(func.max(TrafficData.timestamp)).where(
+        TrafficData.site_name == road_name,
+        TrafficData.approach == direction,
+    )
+    if as_of:
+        stmt = stmt.where(TrafficData.timestamp <= as_of)
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def _find_prediction_result_rows(
+    db: Session,
+    road_name: str,
+    direction: str,
+    model_type: str,
+    as_of: datetime,
+) -> List[Tuple[datetime, int]]:
+    rows = db.execute(
+        select(PredictionResult)
+        .where(
+            PredictionResult.site_name == road_name,
+            PredictionResult.approach == direction,
+            PredictionResult.model_type == model_type,
+            PredictionResult.as_of_time == as_of,
+        )
+        .order_by(PredictionResult.target_time.asc())
+    ).scalars().all()
+    if not rows:
+        return []
+    expected_start = as_of.replace(second=0, microsecond=0)
+    if rows[0].target_time != expected_start:
+        return []
+    return [(row.target_time, row.predicted_vehicle_count) for row in rows]
+
+
+def _store_prediction_result_rows(
+    db: Session,
+    road_name: str,
+    direction: str,
+    model_type: str,
+    as_of: datetime,
+    predicted: List[Tuple[datetime, int]],
+) -> None:
+    db.execute(
+        delete(PredictionResult).where(
+            PredictionResult.site_name == road_name,
+            PredictionResult.approach == direction,
+            PredictionResult.model_type == model_type,
+            PredictionResult.as_of_time == as_of,
+        )
+    )
+    db.add_all(
+        [
+            PredictionResult(
+                as_of_time=as_of,
+                target_time=target_time,
+                site_name=road_name,
+                approach=direction,
+                predicted_vehicle_count=int(count),
+                model_type=model_type,
+            )
+            for target_time, count in predicted
+        ]
+    )
+    db.commit()
+
+
+@ttl_cache(seconds=1800, maxsize=1)
 def get_prediction_meta() -> dict:
     return load_prediction_metadata()
 
 
 def list_prediction_options(db: Session) -> List[PredictionOption]:
-    rows = db.execute(
-        select(TrafficData.site_name, TrafficData.approach)
-        .distinct()
-        .order_by(TrafficData.site_name.asc(), TrafficData.approach.asc())
-    ).all()
+    return _list_prediction_options_cached()
+
+
+@ttl_cache(seconds=1800, maxsize=1)
+def _list_prediction_options_cached() -> List[PredictionOption]:
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(TrafficData.site_name, TrafficData.approach)
+            .distinct()
+            .order_by(TrafficData.site_name.asc(), TrafficData.approach.asc())
+        ).all()
+    finally:
+        db.close()
+
     grouped: Dict[str, List[str]] = {}
     for site_name, approach in rows:
         grouped.setdefault(site_name, []).append(approach)
@@ -422,27 +572,28 @@ def get_prediction_compare(
     direction: str,
 ) -> PredictionCompareSummary:
     road_name = _normalize_road_name(road_name)
-    ts = normalize_ts(time_range)
+    ts = align_to_ten_minutes_floor(normalize_ts(time_range))
     if not ts:
         raise ValueError("time_range is required for prediction comparison.")
     if not road_name or not direction:
         raise ValueError("road_name and direction are required for prediction comparison.")
 
-    predicted = predict_next_hour(site_name=road_name, approach=direction, as_of=ts)
+    predicted = _load_or_generate_prediction_rows(
+        db=db,
+        road_name=road_name,
+        direction=direction,
+        as_of=ts,
+    )
     if not predicted:
         raise ValueError("Prediction model is not ready or no history is available for this road and direction.")
 
-    future_end = predicted[-1][0]
-    rows = get_traffic_data(
-        db=db,
-        time_range=None,
-        start_time=ts.strftime("%Y-%m-%d %H:%M:%S"),
-        end_time=future_end.strftime("%Y-%m-%d %H:%M:%S"),
-        road_name=road_name,
-        direction=direction,
-        limit=5000,
+    cache_key = ts.strftime("%Y-%m-%d %H:%M:%S")
+    actual_map = _get_prediction_actuals_cached(
+        road_name,
+        direction,
+        cache_key,
+        predicted[-1][0].strftime("%Y-%m-%d %H:%M:%S"),
     )
-    actual_map = _aggregate_actual_prediction_window(rows)
     points: List[PredictionComparePoint] = []
     actual_values: List[float] = []
     predicted_values: List[float] = []
@@ -472,7 +623,39 @@ def get_prediction_compare(
     )
 
 
-def _aggregate_actual_prediction_window(rows: List[TrafficRecord]) -> Dict[datetime, int]:
+@ttl_cache(seconds=300, maxsize=512)
+def _get_prediction_actuals_cached(
+    road_name: str,
+    direction: str,
+    start_key: str,
+    end_key: str,
+) -> Dict[datetime, int]:
+    start_ts = datetime.strptime(start_key, "%Y-%m-%d %H:%M:%S")
+    end_ts = datetime.strptime(end_key, "%Y-%m-%d %H:%M:%S")
+    frame = load_prediction_frame(site_name=road_name, approach=direction)
+    if frame.empty:
+        return {}
+    window = frame[(frame["timestamp"] >= start_ts) & (frame["timestamp"] <= end_ts)].copy()
+    if window.empty:
+        return {}
+    rows = [
+        TrafficRecord(
+            timestamp=row.timestamp.to_pydatetime() if hasattr(row.timestamp, "to_pydatetime") else row.timestamp,
+            site_name=row.site_name,
+            approach=row.approach,
+            movement="",
+            vehicle_count=int(row.vehicle_count),
+            avg_speed=float(row.avg_speed),
+            weather=str(row.weather),
+            tmax=int(round(row.tmax)),
+            tmin=int(round(row.tmin)),
+        )
+        for row in window.itertuples(index=False)
+    ]
+    return _aggregate_actual_prediction_window(rows, start_ts)
+
+
+def _aggregate_actual_prediction_window(rows: List[TrafficRecord], anchor_time: datetime) -> Dict[datetime, int]:
     grouped: Dict[datetime, Dict[str, float]] = {}
     for row in rows:
         bucket_minute = (row.timestamp.minute // 10) * 10
@@ -483,14 +666,29 @@ def _aggregate_actual_prediction_window(rows: List[TrafficRecord]) -> Dict[datet
             grouped[bucket] = current
         current["sum"] += float(row.vehicle_count)
         current["n"] += 1.0
+    window_start = anchor_time.replace(second=0, microsecond=0)
+    window_end = window_start + timedelta(hours=1)
     return {
-        bucket + timedelta(minutes=10): int(round(item["sum"] / item["n"])) if item["n"] else 0
+        bucket: int(round(item["sum"] / item["n"])) if item["n"] else 0
         for bucket, item in grouped.items()
+        if window_start <= bucket < window_end
     }
 
 
 def get_analysis_data(
     db: Session,
+    start_time: str,
+    end_time: str,
+    interval_minutes: int,
+    road_name: Optional[str],
+    direction: Optional[str],
+) -> List[AnalysisPoint]:
+    road_name = _normalize_road_name(road_name)
+    return _get_analysis_data_cached(start_time, end_time, interval_minutes, road_name, direction)
+
+
+@ttl_cache(seconds=300, maxsize=512)
+def _get_analysis_data_cached(
     start_time: str,
     end_time: str,
     interval_minutes: int,
@@ -503,29 +701,35 @@ def get_analysis_data(
         raise ValueError("start_time and end_time are required.")
     if end_ts < start_ts + timedelta(hours=1):
         raise ValueError("end_time must be at least 1 hour later than start_time.")
-    if interval_minutes not in (10, 20, 30, 60, 120):
-        raise ValueError("interval_minutes must be one of 10, 20, 30, 60, 120.")
+    if interval_minutes not in (10, 20, 30, 60, 120, 180, 240, 360, 720, 1440):
+        raise ValueError("interval_minutes must be one of 10, 20, 30, 60, 120, 180, 240, 360, 720, 1440.")
 
-    stmt = select(TrafficData).where(
-        and_(
-            TrafficData.timestamp >= start_ts,
-            TrafficData.timestamp <= end_ts,
+    db = SessionLocal()
+    try:
+        stmt = select(TrafficData).where(
+            and_(
+                TrafficData.timestamp >= start_ts,
+                TrafficData.timestamp <= end_ts,
+            )
         )
-    )
-    road_name = _normalize_road_name(road_name)
-    if road_name:
-        stmt = stmt.where(TrafficData.site_name == road_name)
-    if direction:
-        stmt = stmt.where(TrafficData.approach == direction)
+        if road_name:
+            stmt = stmt.where(TrafficData.site_name == road_name)
+        if direction:
+            stmt = stmt.where(TrafficData.approach == direction)
 
-    rows = db.execute(stmt.order_by(TrafficData.timestamp.asc())).scalars().all()
+        rows = db.execute(stmt.order_by(TrafficData.timestamp.asc())).scalars().all()
+    finally:
+        db.close()
+
     if not rows:
         return []
 
     grouped: Dict[datetime, Dict[str, float]] = {}
     for row in rows:
-        minute_group = (row.timestamp.minute // interval_minutes) * interval_minutes
-        bucket = row.timestamp.replace(minute=minute_group, second=0, microsecond=0)
+        elapsed_minutes = int((row.timestamp - start_ts).total_seconds() // 60)
+        bucket_offset = (elapsed_minutes // interval_minutes) * interval_minutes
+        bucket = start_ts + timedelta(minutes=bucket_offset)
+        bucket = bucket.replace(second=0, microsecond=0)
         current = grouped.get(bucket)
         if not current:
             current = {"vehicle_sum": 0.0, "speed_sum": 0.0, "n": 0.0}
@@ -549,10 +753,25 @@ def get_analysis_data(
 
 
 def get_data_time_range(db: Session) -> DataTimeRange:
-    row = db.execute(select(func.min(TrafficData.timestamp), func.max(TrafficData.timestamp))).first()
+    return _get_data_time_range_cached()
+
+
+@ttl_cache(seconds=1800, maxsize=1)
+def _get_data_time_range_cached() -> DataTimeRange:
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        row = db.execute(select(func.min(TrafficData.timestamp), func.max(TrafficData.timestamp))).first()
+    finally:
+        db.close()
+
     if not row or not row[0] or not row[1]:
         raise ValueError("No traffic data found.")
-    return DataTimeRange(min_timestamp=row[0], max_timestamp=row[1])
+    return DataTimeRange(
+        min_timestamp=row[0],
+        max_timestamp=row[1],
+    )
 
 
 def get_direction_routes() -> List[DirectionRoute]:

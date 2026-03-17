@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Iterable, Optional
 
 import pandas as pd
@@ -42,6 +43,14 @@ DEFAULT_SPLIT = DatasetSplit(
 
 
 def load_prediction_frame(
+    site_name: Optional[str] = None,
+    approach: Optional[str] = None,
+) -> pd.DataFrame:
+    return _load_prediction_frame_cached(site_name, approach).copy()
+
+
+@lru_cache(maxsize=32)
+def _load_prediction_frame_cached(
     site_name: Optional[str] = None,
     approach: Optional[str] = None,
 ) -> pd.DataFrame:

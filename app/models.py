@@ -27,3 +27,28 @@ class TrafficData(Base):
     __table_args__ = (
         Index("ix_traffic_timestamp_site_approach", "timestamp", "site_name", "approach"),
     )
+
+
+class PredictionResult(Base):
+    __tablename__ = "prediction_result"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    as_of_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    target_time: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    site_name: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    approach: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    predicted_vehicle_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    model_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_prediction_lookup",
+            "site_name",
+            "approach",
+            "model_type",
+            "as_of_time",
+            "target_time",
+            unique=True,
+        ),
+    )

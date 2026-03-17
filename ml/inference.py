@@ -10,6 +10,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from app.cache import ttl_cache
 from app.config import get_settings
 from ml.dataset import load_prediction_frame
 from ml.features import add_time_features, aggregate_predictions_to_10min, build_tabular_features
@@ -23,14 +24,28 @@ class PredictionEngine:
     scaler: Any | None = None
 
 
+MAX_FEATURE_HISTORY_STEPS = 320
+
+
 def predict_next_hour(
     site_name: str,
     approach: str,
     as_of: Optional[datetime] = None,
 ) -> list[tuple[datetime, int]]:
+    as_of_key = as_of.strftime("%Y-%m-%d %H:%M:%S") if as_of else None
+    return _predict_next_hour_cached(site_name, approach, as_of_key)
+
+
+@ttl_cache(seconds=300, maxsize=512)
+def _predict_next_hour_cached(
+    site_name: str,
+    approach: str,
+    as_of_key: Optional[str] = None,
+) -> list[tuple[datetime, int]]:
     engine = load_prediction_engine()
     if not engine:
         return []
+    as_of = datetime.strptime(as_of_key, "%Y-%m-%d %H:%M:%S") if as_of_key else None
 
     if engine.model_type in {"hist_gradient_boosting", "gradient_boosting_fallback"}:
         return _predict_hgb(engine, site_name, approach, as_of=as_of)
@@ -39,6 +54,23 @@ def predict_next_hour(
     if engine.model_type in {"naive", "seasonal_naive"}:
         return _predict_simple(engine, site_name, approach, as_of=as_of)
     return []
+
+
+def get_history_window(
+    site_name: str,
+    approach: str,
+    as_of: Optional[datetime] = None,
+    required_steps: int = MAX_FEATURE_HISTORY_STEPS,
+) -> pd.DataFrame:
+    history = load_prediction_frame(site_name=site_name, approach=approach)
+    if history.empty:
+        return history
+    history = history.sort_values("timestamp").reset_index(drop=True)
+    if as_of:
+        history = history[history["timestamp"] <= as_of].copy()
+    if history.empty:
+        return history
+    return history.tail(required_steps).reset_index(drop=True)
 
 
 @lru_cache(maxsize=1)
@@ -101,13 +133,7 @@ def _predict_hgb(
     approach: str,
     as_of: Optional[datetime] = None,
 ) -> list[tuple[datetime, int]]:
-    history = load_prediction_frame(site_name=site_name, approach=approach)
-    if history.empty:
-        return []
-
-    history = history.sort_values("timestamp").reset_index(drop=True)
-    if as_of:
-        history = history[history["timestamp"] <= as_of].copy()
+    history = get_history_window(site_name=site_name, approach=approach, as_of=as_of)
     if len(history) < 30:
         return []
     history["vehicle_count"] = history["vehicle_count"].astype(float)
@@ -132,6 +158,8 @@ def _predict_hgb(
         }
         simulated = pd.concat([current, pd.DataFrame([candidate])], ignore_index=True)
         feature_frame = build_tabular_features(simulated, lookback_steps=engine.metadata.get("lookback_steps", 24))
+        if feature_frame.empty:
+            return []
         row = feature_frame.iloc[[-1]][engine.metadata["numeric_features"] + engine.metadata["categorical_features"]]
         pred = float(model.predict(row)[0])
         simulated.loc[simulated.index[-1], "vehicle_count"] = max(0.0, pred)
@@ -139,7 +167,7 @@ def _predict_hgb(
         future_times.append(next_ts.to_pydatetime())
         preds.append(max(0.0, pred))
 
-    return aggregate_predictions_to_10min(future_times, preds)
+    return aggregate_predictions_to_10min(future_times, preds, anchor_time=latest["timestamp"])
 
 
 def _predict_lstm(
@@ -148,13 +176,9 @@ def _predict_lstm(
     approach: str,
     as_of: Optional[datetime] = None,
 ) -> list[tuple[datetime, int]]:
-    history = load_prediction_frame(site_name=site_name, approach=approach)
+    history = get_history_window(site_name=site_name, approach=approach, as_of=as_of)
     if history.empty or engine.scaler is None or engine.model is None:
         return []
-
-    history = history.sort_values("timestamp").reset_index(drop=True)
-    if as_of:
-        history = history[history["timestamp"] <= as_of].copy()
 
     metrics = engine.metadata.get("metrics", {})
     feature_columns = metrics.get("feature_columns") or engine.metadata.get("feature_columns")
@@ -176,7 +200,7 @@ def _predict_lstm(
 
     base_time = pd.Timestamp(current.iloc[-1]["timestamp"])
     future_times = [(base_time + timedelta(minutes=5 * (idx + 1))).to_pydatetime() for idx in range(len(preds))]
-    return aggregate_predictions_to_10min(future_times, preds)
+    return aggregate_predictions_to_10min(future_times, preds, anchor_time=current.iloc[-1]["timestamp"])
 
 
 def _predict_simple(
@@ -185,12 +209,9 @@ def _predict_simple(
     approach: str,
     as_of: Optional[datetime] = None,
 ) -> list[tuple[datetime, int]]:
-    history = load_prediction_frame(site_name=site_name, approach=approach)
+    history = get_history_window(site_name=site_name, approach=approach, as_of=as_of, required_steps=288)
     if history.empty:
         return []
-    history = history.sort_values("timestamp").reset_index(drop=True)
-    if as_of:
-        history = history[history["timestamp"] <= as_of].copy()
     if history.empty:
         return []
 
@@ -203,4 +224,4 @@ def _predict_simple(
     times = [start + timedelta(minutes=5 * idx) for idx in range(12)]
     if len(base_series) < 12:
         base_series = (base_series * 12)[:12]
-    return aggregate_predictions_to_10min(times, base_series[:12])
+    return aggregate_predictions_to_10min(times, base_series[:12], anchor_time=history.iloc[-1]["timestamp"])

@@ -107,18 +107,20 @@ def build_lstm_sequences(
 def aggregate_predictions_to_10min(
     timestamps: Sequence[pd.Timestamp],
     values: Sequence[float],
+    anchor_time: pd.Timestamp | None = None,
 ) -> list[tuple[pd.Timestamp, int]]:
     if not timestamps or not values:
         return []
     result: list[tuple[pd.Timestamp, int]] = []
     ts_list = list(pd.to_datetime(list(timestamps)))
     value_list = list(values)
+    base_anchor = pd.Timestamp(anchor_time) if anchor_time is not None else ts_list[0]
     for idx in range(0, min(len(ts_list), len(value_list)), 2):
         chunk_ts = ts_list[idx : idx + 2]
         chunk_values = value_list[idx : idx + 2]
         if not chunk_ts or not chunk_values:
             continue
-        bucket_ts = chunk_ts[-1]
+        bucket_ts = base_anchor + pd.Timedelta(minutes=(idx // 2) * 10)
         avg_value = sum(chunk_values) / len(chunk_values)
         result.append((bucket_ts.to_pydatetime(), int(round(max(0, avg_value)))))
     return result

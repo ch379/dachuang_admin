@@ -75,6 +75,19 @@ pip install -r requirements-ml.txt
 python scripts/train_lstm.py
 ```
 
+7. 预生成预测结果到数据库（推荐，用于提升预测接口速度）
+
+```powershell
+python scripts/precompute_predictions.py
+```
+
+只预生成最近一段时间可用的锚点，也可以加过滤条件：
+
+```powershell
+python scripts/precompute_predictions.py --start "2025-10-15 00:00:00" --end "2025-10-21 23:55:00"
+python scripts/precompute_predictions.py --road-name 恒福路 --direction 东向西
+```
+
 说明：
 - 当前这台环境是 `Python 3.13`，TensorFlow LSTM 训练通常需要单独使用 `Python 3.11` 或 `Python 3.12` 虚拟环境。
 - 因此当前在线预测默认先使用基线最佳模型，LSTM 作为对比模型单独训练。
@@ -163,3 +176,4 @@ GET /api/weather?time_range=2026-03-01 08:05:00
 - `GET /api/traffic` 直接查库返回真实数据。
 - `GET /api/weather` 按条件聚合库中的天气数据。
 - `GET /api/prediction` 现按 `road_name + direction` 返回未来 1 小时的 6 个 10 分钟预测点。
+- `prediction_result` 表用于缓存/预存预测结果；`GET /api/prediction` 会优先查表，查不到再回退到在线推理。
