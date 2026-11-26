@@ -20,11 +20,13 @@ import {
   fetchAnalysis,
   fetchDataRange,
   fetchDirectionRoutes,
+  fetchDirectionFlows,
   fetchPrediction,
   fetchPredictionCompare,
   fetchPredictionMeta,
   fetchPredictionOptions,
   fetchPublicConfig,
+  postUserAlert,
   fetchTraffic,
 } from "./api/client";
 import {
@@ -42,19 +44,19 @@ import {
   formatShortTime,
   mergePredictionSeries,
   resolveInterval,
-  riskLabel,
   toApiTime,
   toInputTime,
 } from "./adminHelpers";
 import {
   buildEffectSeries,
+  buildInterventionTargets,
   buildInterventions,
   buildRiskReasons,
   congestionAfter,
   congestionIndex,
-  weatherSummary,
 } from "./adminModel";
 import "./App.css";
+import { FLOW_COLORS, flowDescription } from "./trafficMap";
 
 const MAP_DEFAULT = { center: [106.506145, 29.639573], zoom: 16.7 };
 const DEFAULT_START = "2025-09-02T00:00";
@@ -117,7 +119,7 @@ function buildCalendar(monthValue) {
   const firstDay = new Date(year, month - 1, 1);
   const startOffset = (firstDay.getDay() + 6) % 7;
   const firstCell = new Date(year, month - 1, 1 - startOffset);
-  return Array.from({ length: 42 }, (_, index) => {
+  return Array.from({ length: 35 }, (_, index) => {
     const cell = new Date(firstCell);
     cell.setDate(firstCell.getDate() + index);
     const value = `${cell.getFullYear()}-${`${cell.getMonth() + 1}`.padStart(2, "0")}-${`${cell.getDate()}`.padStart(2, "0")}`;
@@ -138,10 +140,109 @@ function withinLimits(value, min, max) {
   return true;
 }
 
+function weatherIcon(weather) {
+  const text = `${weather || ""}`;
+  if (text.includes("雨")) return "🌧";
+  if (text.includes("云") || text.includes("阴")) return "☁";
+  if (text.includes("晴")) return "☀";
+  if (text.includes("雾")) return "🌫";
+  return "⛅";
+}
+
+function buildWeatherBadge(rows, siteName, direction) {
+  const filtered = rows
+    .filter((row) => row.site_name === siteName && (!direction || row.approach === direction))
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+  if (!filtered.length) {
+    return { iconKey: "", headline: "天气待同步", breakdown: "暂无有效天气数据" };
+  }
+
+  const counts = new Map();
+  filtered.forEach((row) => {
+    const key = row.weather || "未知";
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+
+  const firstWeather = filtered[0].weather || "未知";
+  const lastWeather = filtered[filtered.length - 1].weather || firstWeather;
+  const sorted = Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  const breakdown = sorted
+    .slice(0, 3)
+    .map(([name, count]) => `${name} ${Math.round((count / filtered.length) * 100)}%`)
+    .join(" / ");
+
+  return {
+    iconKey: lastWeather,
+    headline: firstWeather === lastWeather ? firstWeather : `${firstWeather}转${lastWeather}`,
+    breakdown,
+  };
+}
+
+function PredictionTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+
+  const history = payload.find((item) => item.dataKey === "history" && item.value != null);
+  const predicted = payload.find((item) => item.dataKey === "predicted" && item.value != null);
+
+  if (!history && !predicted) return null;
+
+  return (
+    <div className="prediction-tooltip">
+      <div className="prediction-tooltip__time">{label}</div>
+      {predicted ? <div className="prediction-tooltip__row">预计：{predicted.value} 辆车</div> : null}
+      {history ? <div className="prediction-tooltip__row">历史：{history.value} 辆车</div> : null}
+    </div>
+  );
+}
+
+function PopupChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+
+  const point = payload.find((item) => item.value != null);
+  if (!point) return null;
+
+  const labelMap = {
+    vehicle_count: "车流量",
+    avg_speed: "车速",
+  };
+  const unitMap = {
+    vehicle_count: "辆",
+    avg_speed: "km/h",
+  };
+
+  return (
+    <div className="prediction-tooltip">
+      <div className="prediction-tooltip__time">{formatShortTime(label)}</div>
+      <div className="prediction-tooltip__row">
+        {labelMap[point.dataKey] || "数值"}：{point.value} {unitMap[point.dataKey] || ""}
+      </div>
+    </div>
+  );
+}
+
+function EffectChartTooltip({ active, payload, label }) {
+  if (!active || !payload?.length) return null;
+
+  const before = payload.find((item) => item.dataKey === "before" && item.value != null);
+  const after = payload.find((item) => item.dataKey === "after" && item.value != null);
+  if (!before && !after) return null;
+
+  return (
+    <div className="prediction-tooltip">
+      <div className="prediction-tooltip__time">{label}</div>
+      {before ? <div className="prediction-tooltip__row">干预前预测：{before.value} 辆车</div> : null}
+      {after ? <div className="prediction-tooltip__row">干预后预测：{after.value} 辆车</div> : null}
+    </div>
+  );
+}
+
 function App() {
   const [amapKey, setAmapKey] = useState("");
   const [intersections, setIntersections] = useState([]);
   const [routes, setRoutes] = useState([]);
+  const [directionFlows, setDirectionFlows] = useState([]);
+  const [mapReady, setMapReady] = useState(false);
   const [predictionOptions, setPredictionOptions] = useState([]);
   const [predictionMeta, setPredictionMeta] = useState(null);
   const [timeLimit, setTimeLimit] = useState({ min: "", max: "" });
@@ -161,19 +262,30 @@ function App() {
   const [popupIntervalMode, setPopupIntervalMode] = useState("auto");
   const [popupAnalysis, setPopupAnalysis] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [compareLoading, setCompareLoading] = useState(false);
   const [error, setError] = useState("");
   const [executedActions, setExecutedActions] = useState({});
-  const [actionLogs, setActionLogs] = useState([]);
+  const [selectedInterventionTargetId, setSelectedInterventionTargetId] = useState("");
+  const [loadedPredictionContext, setLoadedPredictionContext] = useState({
+    end: "",
+    site: "",
+    direction: "",
+  });
 
   const mapContainerRef = useRef(null);
+  const popupRef = useRef(null);
   const mapRef = useRef(null);
   const AMapRef = useRef(null);
   const overlaysRef = useRef([]);
   const timeWrapRef = useRef(null);
+  const mainRequestRef = useRef(0);
+  const compareRequestRef = useRef(0);
+  const [popupBeam, setPopupBeam] = useState(null);
 
   useEffect(() => {
     async function bootstrap() {
       setLoading(true);
+      setError("");
       try {
         const [config, range, routeData, options, meta] = await Promise.all([
           fetchPublicConfig(),
@@ -204,7 +316,7 @@ function App() {
         setSiteDirections(directionMap);
         setSelectedSite(options?.[0]?.site_name || config.intersections?.[0]?.site_name || "");
       } catch (bootstrapError) {
-        setError(`初始化失败：${bootstrapError.message}`);
+        setError(`鍒濆鍖栧け璐ワ細${bootstrapError.message}`);
       } finally {
         setLoading(false);
       }
@@ -219,9 +331,12 @@ function App() {
     if (!appliedRange.start || !appliedRange.end || !selectedSite || !selectedDirection) return;
 
     async function loadMainData() {
+      const requestId = mainRequestRef.current + 1;
+      mainRequestRef.current = requestId;
       setLoading(true);
+      setError("");
       try {
-        const [trafficData, predictionData, compareData] = await Promise.all([
+        const [trafficData, predictionData, flowData] = await Promise.all([
           fetchTraffic({
             start_time: toApiTime(appliedRange.start),
             end_time: toApiTime(appliedRange.end),
@@ -232,24 +347,61 @@ function App() {
             road_name: selectedSite,
             direction: selectedDirection,
           }),
-          fetchPredictionCompare({
-            time_range: toApiTime(appliedRange.end),
-            road_name: selectedSite,
-            direction: selectedDirection,
+          fetchDirectionFlows({
+            start_time: toApiTime(appliedRange.start),
+            end_time: toApiTime(appliedRange.end),
           }),
         ]);
+        if (requestId !== mainRequestRef.current) return;
         setTrafficRows(trafficData || []);
+        setDirectionFlows(flowData || []);
         setPredictionRows(predictionData || []);
-        setPredictionCompare(compareData);
+        setLoadedPredictionContext({
+          end: appliedRange.end,
+          site: selectedSite,
+          direction: selectedDirection,
+        });
       } catch (loadError) {
-        setError(`主数据加载失败：${loadError.message}`);
+        if (requestId !== mainRequestRef.current) return;
+        setError(`涓绘暟鎹姞杞藉け璐ワ細${loadError.message}`);
       } finally {
-        setLoading(false);
+        if (requestId === mainRequestRef.current) {
+          setLoading(false);
+        }
       }
     }
 
     loadMainData();
   }, [appliedRange, selectedSite, selectedDirection]);
+
+  useEffect(() => {
+    if (!appliedRange.end || !selectedSite || !selectedDirection) return;
+
+    async function loadCompareData() {
+      const requestId = compareRequestRef.current + 1;
+      compareRequestRef.current = requestId;
+      setCompareLoading(true);
+      setPredictionCompare(null);
+      try {
+        const compareData = await fetchPredictionCompare({
+          time_range: toApiTime(appliedRange.end),
+          road_name: selectedSite,
+          direction: selectedDirection,
+        });
+        if (requestId !== compareRequestRef.current) return;
+        setPredictionCompare(compareData);
+      } catch {
+        if (requestId !== compareRequestRef.current) return;
+        setPredictionCompare(null);
+      } finally {
+        if (requestId === compareRequestRef.current) {
+          setCompareLoading(false);
+        }
+      }
+    }
+
+    loadCompareData();
+  }, [appliedRange.end, selectedSite, selectedDirection]);
 
   useEffect(() => {
     if (!popupOpen || !selectedSite || !selectedDirection || !appliedRange.start || !appliedRange.end) return;
@@ -276,27 +428,49 @@ function App() {
     () => buildSiteStats(trafficRows, predictionOptions, siteDirections).slice(0, 4),
     [trafficRows, predictionOptions, siteDirections]
   );
+  const monitorRows = useMemo(() => buildMonitorRows(trafficRows), [trafficRows]);
+  const interventionTargets = useMemo(() => buildInterventionTargets(monitorRows), [monitorRows]);
+  const selectedInterventionTarget = useMemo(
+    () => interventionTargets.find((item) => item.id === selectedInterventionTargetId) || null,
+    [interventionTargets, selectedInterventionTargetId]
+  );
   const selectedSummary = useMemo(
     () => siteStats.find((item) => item.siteName === selectedSite) || siteStats[0],
     [siteStats, selectedSite]
   );
-  const monitorRows = useMemo(() => buildMonitorRows(trafficRows), [trafficRows]);
   const predictionStats = useMemo(() => buildPredictionStats(predictionRows), [predictionRows]);
   const predictionChartData = useMemo(() => {
-    const historyRows = buildHistorySeries(trafficRows, selectedSite, selectedDirection, appliedRange.end);
+    if (!loadedPredictionContext.end || !loadedPredictionContext.site || !loadedPredictionContext.direction) {
+      return [];
+    }
+    const historyRows = buildHistorySeries(
+      trafficRows,
+      loadedPredictionContext.site,
+      loadedPredictionContext.direction,
+      loadedPredictionContext.end
+    );
     return mergePredictionSeries(historyRows, predictionRows);
-  }, [trafficRows, selectedSite, selectedDirection, appliedRange.end, predictionRows]);
+  }, [trafficRows, predictionRows, loadedPredictionContext]);
   const interventions = useMemo(
-    () => buildInterventions(selectedSummary, predictionStats),
-    [selectedSummary, predictionStats]
+    () => buildInterventions(selectedInterventionTarget ? [selectedInterventionTarget] : []),
+    [selectedInterventionTarget]
   );
+  const allInterventionEffects = useMemo(
+    () => [...(interventions.agencyActions || []), ...(interventions.userMessages || [])],
+    [interventions]
+  );
+  const appliedInterventionEffects = useMemo(
+    () => allInterventionEffects.filter((item) => executedActions[item.id]),
+    [allInterventionEffects, executedActions]
+  );
+  const activeInterventionTargetId = selectedInterventionTargetId;
   const effectSeries = useMemo(
     () =>
-      buildEffectSeries(predictionRows, interventions).map((item) => ({
+      buildEffectSeries(predictionRows, appliedInterventionEffects).map((item) => ({
         ...item,
         label: formatShortTime(item.label),
       })),
-    [predictionRows, interventions]
+    [predictionRows, appliedInterventionEffects]
   );
   const reasons = useMemo(
     () => buildRiskReasons(selectedSummary, predictionStats),
@@ -315,8 +489,8 @@ function App() {
     [popupAnalysis]
   );
   const weather = useMemo(
-    () => weatherSummary(trafficRows, selectedSite, selectedDirection),
-    [trafficRows, selectedSite, selectedDirection]
+    () => buildWeatherBadge(trafficRows, loadedPredictionContext.site, loadedPredictionContext.direction),
+    [trafficRows, loadedPredictionContext]
   );
   const congestionBefore = useMemo(
     () => congestionIndex(selectedSummary?.avgVehicle || 0, selectedSummary?.avgSpeed || 40),
@@ -328,12 +502,28 @@ function App() {
   );
 
   useEffect(() => {
+    setExecutedActions({});
+    setSelectedInterventionTargetId("");
+  }, [appliedRange.start, appliedRange.end]);
+
+  useEffect(() => {
+    if (!selectedInterventionTargetId) return;
+    if (!interventionTargets.some((item) => item.id === selectedInterventionTargetId)) {
+      setSelectedInterventionTargetId("");
+    }
+  }, [interventionTargets, selectedInterventionTargetId]);
+
+  useEffect(() => {
     if (!mapContainerRef.current || !intersections.length || !amapKey) return;
     let canceled = false;
 
     async function initMap() {
       if (mapRef.current) return;
       try {
+        const securityJsCode = process.env.REACT_APP_AMAP_SECURITY_JS_CODE;
+        if (securityJsCode) {
+          window._AMapSecurityConfig = { ...window._AMapSecurityConfig, securityJsCode };
+        }
         const AMap = await AMapLoader.load({
           key: amapKey,
           version: "2.0",
@@ -358,8 +548,9 @@ function App() {
         });
         map.addControl(new AMap.Scale());
         mapRef.current = map;
+        setMapReady(true);
       } catch (mapError) {
-        setError(`地图加载失败：${mapError.message}`);
+        setError(`鍦板浘鍔犺浇澶辫触锛?{mapError.message}`);
       }
     }
 
@@ -376,10 +567,11 @@ function App() {
     overlaysRef.current = [];
 
     const AMap = AMapRef.current;
-    const riskMap = new Map(siteStats.map((item) => [item.siteName, item.risk]));
+    const flowMap = new Map(directionFlows.map((item) => [`${item.site_name}|${item.direction}`, item]));
 
     intersections.forEach((site) => {
-      const risk = riskMap.get(site.site_name) || "low";
+      const flow = flowMap.get(`${site.site_name}|${siteDirections[site.site_name]}`);
+      const color = FLOW_COLORS[flow?.level || "unknown"];
       const marker = new AMap.Marker({
         position: [site.longitude, site.latitude],
         anchor: "bottom-center",
@@ -387,8 +579,7 @@ function App() {
           <div class="map-marker ${selectedSite === site.site_name ? "active" : ""}">
             <div class="map-marker__label">${site.site_name}</div>
             <div class="map-node">
-              <span class="map-node__ring" style="border-color:${RISK_COLORS[risk]}"></span>
-              <span class="map-node__core" style="background:${RISK_COLORS[risk]}"></span>
+              <span class="map-node__core" style="background:${color}"></span>
             </div>
           </div>
         `,
@@ -402,19 +593,85 @@ function App() {
     });
 
     routes.forEach((route) => {
-      const risk = riskMap.get(route.site_name) || "low";
+      if (route.path.length < 2) return;
+      const flow = flowMap.get(`${route.site_name}|${route.direction}`);
       const highlighted = route.site_name === selectedSite && route.direction === selectedDirection;
       const polyline = new AMap.Polyline({
-        path: route.path.map((point) => [point.longitude, point.latitude]),
-        strokeColor: highlighted ? "#73e7ff" : RISK_COLORS[risk],
-        strokeWeight: highlighted ? 6 : 4,
-        strokeOpacity: highlighted ? 0.96 : 0.55,
+        path: route.path.map(({ longitude, latitude }) => [longitude, latitude]),
+        strokeColor: FLOW_COLORS[flow?.level || "unknown"],
+        strokeWeight: 4,
+        strokeOpacity: flow ? 0.96 : 0.55,
         lineCap: "round",
+        lineJoin: "round",
+        showDir: flow?.average_count > 0,
+        zIndex: highlighted ? 65 : 60,
+        extData: { site: route.site_name, direction: route.direction, flow },
       });
+      polyline.on("click", () => {
+        setSelectedSite(route.site_name);
+        setSiteDirections((previous) => ({ ...previous, [route.site_name]: route.direction }));
+        setPopupOpen(true);
+      });
+      polyline.on("mouseover", () => {
+        mapContainerRef.current.title = `${route.site_name} · ${route.direction}\n${flowDescription(flow)}`;
+      });
+      polyline.on("mouseout", () => { mapContainerRef.current.title = ""; });
       polyline.setMap(mapRef.current);
       overlaysRef.current.push(polyline);
     });
-  }, [intersections, routes, siteStats, selectedSite, selectedDirection]);
+  }, [intersections, routes, directionFlows, siteDirections, selectedSite, selectedDirection, mapReady]);
+
+  useEffect(() => {
+    if (!popupOpen || !selectedSite || !mapRef.current || !popupRef.current || !mapContainerRef.current) {
+      setPopupBeam(null);
+      return;
+    }
+
+    function updatePopupBeam() {
+      const site = intersections.find((item) => item.site_name === selectedSite);
+      if (!site || !mapRef.current || !popupRef.current || !mapContainerRef.current) return;
+
+      const pixel = mapRef.current.lngLatToContainer([site.longitude, site.latitude]);
+      const mapRect = mapContainerRef.current.getBoundingClientRect();
+      const popupEl = popupRef.current;
+      const popupRect = popupEl.getBoundingClientRect();
+      const startX = mapRect.left + pixel.x;
+      const startY = mapRect.top + pixel.y - 13;
+      const elbowX = popupRect.left - 54;
+      const elbowY = popupRect.top + popupRect.height - 86;
+      const targetX = popupRect.left + 4;
+      const targetY = elbowY;
+
+      setPopupBeam({
+        startX,
+        startY,
+        elbowX,
+        elbowY,
+        targetX,
+        targetY,
+      });
+    }
+
+    const timer = window.setTimeout(updatePopupBeam, 30);
+    const handleResize = () => updatePopupBeam();
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [popupOpen, selectedSite, intersections, selectedDirection, popupAnalysis]);
+
+  useEffect(() => {
+    if (!mapRef.current || !mapRef.current.setStatus) return;
+    mapRef.current.setStatus({
+      dragEnable: !popupOpen,
+      zoomEnable: !popupOpen,
+      doubleClickZoom: !popupOpen,
+      keyboardEnable: !popupOpen,
+      scrollWheel: !popupOpen,
+    });
+  }, [popupOpen]);
 
   useEffect(() => {
     if (!timeOpen) return undefined;
@@ -487,28 +744,38 @@ function App() {
 
   function runAction(action) {
     setExecutedActions((prev) => ({ ...prev, [action.id]: "执行中" }));
-    setActionLogs((prev) => [
-      {
-        id: `${action.id}-${Date.now()}`,
-        time: formatShortTime(new Date()),
-        status: "执行中",
-        text: `${action.title} / ${action.target}`,
-      },
-      ...prev,
-    ].slice(0, 6));
-
-    window.setTimeout(() => {
-      setExecutedActions((prev) => ({ ...prev, [action.id]: "已下发" }));
-      setActionLogs((prev) => [
-        {
-          id: `${action.id}-done-${Date.now()}`,
-          time: formatShortTime(new Date()),
-          status: "已下发",
-          text: `${action.title} / ${action.target}`,
-        },
-        ...prev,
-      ].slice(0, 6));
+    window.setTimeout(async () => {
+      try {
+        if (action.message) {
+          await postUserAlert({
+            title: `${action.siteName || selectedSite || "当前路口"}出行提醒`,
+            message: action.message,
+            site_name: action.siteName || selectedSite || null,
+            direction: action.direction || selectedDirection || null,
+            start_time: appliedRange.start ? toApiTime(appliedRange.start) : null,
+            end_time: appliedRange.end ? toApiTime(appliedRange.end) : null,
+            action_label: action.actionLabel || "推送",
+          });
+        }
+        setExecutedActions((prev) => ({ ...prev, [action.id]: action.message ? "已推送" : "已下发" }));
+      } catch (runError) {
+        setExecutedActions((prev) => ({ ...prev, [action.id]: "失败" }));
+        setError(`消息下发失败：${runError.message}`);
+      }
     }, 800);
+  }
+
+  function focusInterventionTarget(target) {
+    if (!target?.siteName || !target?.direction) return;
+    setSelectedInterventionTargetId(target.id);
+    setSelectedSite(target.siteName);
+    setSiteDirections((prev) => ({ ...prev, [target.siteName]: target.direction }));
+    setPopupOpen(false);
+  }
+
+  function resetMapView() {
+    if (!mapRef.current) return;
+    mapRef.current.setZoomAndCenter(MAP_DEFAULT.zoom, MAP_DEFAULT.center);
   }
 
   return (
@@ -598,13 +865,13 @@ function App() {
                 </div>
               </label>
               <label>
-                <span>终止时间</span>
+                <span>结束时间</span>
                 <div className={`time-display ${activeTimeField === "end" ? "active" : ""}`}>
                   <strong>{toDisplayValue(endInput)}</strong>
                   <button
                     type="button"
                     className="time-display__icon"
-                    aria-label="选择终止时间"
+                    aria-label="选择结束时间"
                     onClick={() => {
                       setActiveTimeField("end");
                       setPickerMonth(monthKey(endInput));
@@ -736,178 +1003,165 @@ function App() {
       </section>
 
       <section className="main-grid">
-        <aside className="side-panel">
+        <aside className="side-panel side-panel--intervention">
           <div className="panel-frame">
             <div className="panel-head">
               <h2>干预建议</h2>
-              <span>{selectedSummary?.siteName || "未选中路口"}</span>
             </div>
-            <div className="intervention-list">
-              {interventions.map((item) => (
-                <article key={item.id} className="action-card">
-                  <div className="action-card__title">
-                    <strong>{item.title}</strong>
-                    <b>{item.priority}</b>
-                  </div>
-                  <span>{item.target}</span>
-                  <p>{item.reason}</p>
-                  <div className="action-card__foot">
-                    <small>{item.effectText}</small>
-                    <button type="button" onClick={() => runAction(item)}>
-                      {executedActions[item.id] || "执行"}
+            <div className="intervention-focus">
+              <div className="intervention-focus__head">
+                <strong>重点干预对象</strong>
+                <span>当前时间段内交通压力较大的路口及其方向</span>
+              </div>
+              {interventionTargets.length ? (
+                <div className="intervention-focus__list">
+                  {interventionTargets.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={`focus-chip ${activeInterventionTargetId === item.id ? "is-active" : ""}`}
+                      onClick={() => focusInterventionTarget(item)}
+                    >
+                      <strong>{item.siteName}</strong>
+                      <span>{item.direction}</span>
                     </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </div>
-
-          <div className="panel-frame">
-            <div className="panel-head">
-              <h2>执行状态</h2>
-              <span>最近 6 条</span>
-            </div>
-            <div className="log-list">
-              {actionLogs.length ? (
-                actionLogs.map((item) => (
-                  <article key={item.id} className="log-card">
-                    <div>
-                      <span>{item.time}</span>
-                      <strong>{item.status}</strong>
-                    </div>
-                    <p>{item.text}</p>
-                  </article>
-                ))
+                  ))}
+                </div>
               ) : (
-                <div className="empty-card">暂无执行日志</div>
+                <div className="empty-card">当前时段暂无明显干预对象</div>
               )}
+            </div>
+
+            {selectedInterventionTarget ? (
+              <div className="intervention-grid">
+                <div className="intervention-section">
+                  <div className="intervention-list intervention-list--framed">
+                    <div className="intervention-list__title">面向交通管理部门</div>
+                    {interventions.agencyActions.length ? (
+                      interventions.agencyActions.map((item) => (
+                        <article key={item.id} className="action-row">
+                          <div className="action-row__content">
+                            <i className="action-row__dot" />
+                            <div className="action-row__copy">
+                              <p>{item.reason}</p>
+                              <small>{item.effectText}</small>
+                            </div>
+                          </div>
+                          <div className="action-row__side">
+                            <button type="button" onClick={() => runAction(item)}>
+                              {executedActions[item.id] || item.actionLabel || "执行"}
+                            </button>
+                          </div>
+                        </article>
+                      ))
+                    ) : (
+                      <div className="empty-card">当前时段暂无管理部门干预建议</div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="intervention-section">
+                  <div className="intervention-list intervention-list--framed">
+                    <div className="intervention-list__title">面向用户推送</div>
+                    {interventions.userMessages.length ? (
+                      interventions.userMessages.map((item) => (
+                        <article key={item.id} className="action-row action-row--message">
+                          <div className="action-row__content">
+                            <i className="action-row__dot" />
+                            <div className="action-row__copy">
+                              <p>{item.message}</p>
+                              <small>{item.effectText}</small>
+                            </div>
+                          </div>
+                          <div className="action-row__side">
+                            <button type="button" onClick={() => runAction(item)}>
+                              {executedActions[item.id] || item.actionLabel || "推送"}
+                            </button>
+                          </div>
+                        </article>
+                      ))
+                    ) : (
+                      <div className="empty-card">当前时段暂无可推送的用户消息</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="intervention-effect">
+              <div className="panel-head intervention-effect__head">
+                <h2>干预结果预测</h2>
+                <span>未来 1 小时干预前后对比</span>
+              </div>
+              <div className="effect-summary">
+                <article>
+                  <span>执行策略数</span>
+                  <strong>{Object.keys(executedActions).length}</strong>
+                </article>
+                <article>
+                  <span>拥堵指数前</span>
+                  <strong>{congestionBefore}</strong>
+                </article>
+                <article>
+                  <span>拥堵指数后</span>
+                  <strong>{congestionAfterValue}</strong>
+                </article>
+              </div>
+              <ResponsiveContainer width="100%" height={150}>
+                <LineChart
+                  key={`${Object.keys(executedActions).sort().join("|")}-${effectSeries.length}`}
+                  data={effectSeries}
+                  margin={{ top: 8, right: 28, left: -18, bottom: 0 }}
+                >
+                  <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: "#8da6bb", fontSize: 10 }} />
+                  <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} />
+                  <Tooltip content={<EffectChartTooltip />} cursor={{ stroke: "rgba(114, 231, 255, 0.24)", strokeWidth: 1 }} />
+                  <Line
+                    type="monotone"
+                    dataKey="before"
+                    stroke="#ff6b6b"
+                    strokeWidth={2.2}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                  {appliedInterventionEffects.length ? (
+                    <Line
+                      type="monotone"
+                      dataKey="after"
+                      stroke="#57efb2"
+                      strokeWidth={2.4}
+                      dot={false}
+                      isAnimationActive
+                      animationDuration={420}
+                    />
+                  ) : null}
+                </LineChart>
+              </ResponsiveContainer>
+              <div className="prediction-legend intervention-effect__legend">
+                <span><i className="legend-line intervention-before" /> 红线：干预前预测</span>
+                {appliedInterventionEffects.length ? (
+                  <span><i className="legend-line intervention-after" /> 绿线：干预后预测</span>
+                ) : null}
+              </div>
             </div>
           </div>
         </aside>
 
         <section className="center-column">
           <div className="map-frame">
+            <button type="button" className="map-reset-button" onClick={resetMapView} aria-label="回到默认视角">
+              <span className="map-reset-button__icon">◎</span>
+            </button>
             <div ref={mapContainerRef} className="map-canvas" />
-
-            {popupOpen ? (
-              <div className="detail-popup">
-                <div className="detail-popup__head">
-                  <div>
-                    <span>{selectedSite}</span>
-                    <strong>{selectedDirection}</strong>
-                  </div>
-                  <button type="button" onClick={() => setPopupOpen(false)}>
-                    关闭
-                  </button>
-                </div>
-
-                <div className="detail-popup__metrics">
-                  <div>
-                    <span>平均车流量</span>
-                    <strong>{selectedSummary?.avgVehicle || 0}</strong>
-                  </div>
-                  <div>
-                    <span>平均车速</span>
-                    <strong>{selectedSummary?.avgSpeed || 0} km/h</strong>
-                  </div>
-                </div>
-
-                <label className="popup-control">
-                  <span>时间颗粒度</span>
-                  <select value={popupIntervalMode} onChange={(event) => setPopupIntervalMode(event.target.value)}>
-                    {INTERVAL_OPTIONS.map((item) => (
-                      <option key={item.value} value={item.value}>
-                        {item.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-
-                <div className="detail-charts">
-                  <div className="mini-chart">
-                    <span>车流量</span>
-                    <ResponsiveContainer width="100%" height={136}>
-                      <BarChart data={popupAnalysis}>
-                        <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
-                        <XAxis dataKey="bucket_start" tickFormatter={formatShortTime} tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                        <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} domain={popupVehicleDomain} />
-                        <Tooltip labelFormatter={(value) => formatShortTime(value)} />
-                        <Bar dataKey="vehicle_count" fill="#5ecdfc" radius={[4, 4, 0, 0]} />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-
-                  <div className="mini-chart">
-                    <span>车速</span>
-                    <ResponsiveContainer width="100%" height={136}>
-                      <LineChart data={popupAnalysis}>
-                        <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
-                        <XAxis dataKey="bucket_start" tickFormatter={formatShortTime} tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                        <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} domain={popupSpeedDomain} />
-                        <Tooltip labelFormatter={(value) => formatShortTime(value)} />
-                        <Line type="monotone" dataKey="avg_speed" stroke="#7bf4cf" strokeWidth={2.2} dot={false} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-
-                <div className="wheel-block">
-                  <span>方向车流分布</span>
-                  <div className="wheel-layout">
-                    <ResponsiveContainer width="46%" height={132}>
-                      <PieChart>
-                        <Pie data={directionPieData} dataKey="value" nameKey="name" innerRadius={26} outerRadius={50}>
-                          {directionPieData.map((item, index) => (
-                            <Cell key={item.name} fill={PIE_COLORS[index % PIE_COLORS.length]} />
-                          ))}
-                        </Pie>
-                        <Tooltip />
-                      </PieChart>
-                    </ResponsiveContainer>
-                    <div className="wheel-legend">
-                      {directionPieData.map((item, index) => (
-                        <div key={item.name}>
-                          <i style={{ backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }} />
-                          <span>{item.name}</span>
-                          <strong>{item.value}</strong>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : null}
-          </div>
-
-          <div className="effect-frame">
-            <div className="panel-head">
-              <h2>干预结果预测</h2>
-              <span>地图下方附属预测区</span>
+            <div className="traffic-legend" title="按本方向历史5分钟车流的50%和80%分位分级，统计所选时段平均车流。">
+              <strong>时段车流</strong>
+              <span><i style={{ background: FLOW_COLORS.low }} />较低</span>
+              <span><i style={{ background: FLOW_COLORS.medium }} />中等</span>
+              <span><i style={{ background: FLOW_COLORS.high }} />较高</span>
+              <span><i style={{ background: FLOW_COLORS.unknown }} />无数据</span>
+              <small>各方向历史车流分级</small>
             </div>
-            <div className="effect-summary">
-              <article>
-                <span>执行策略数</span>
-                <strong>{Object.keys(executedActions).length}</strong>
-              </article>
-              <article>
-                <span>拥堵指数前</span>
-                <strong>{congestionBefore}</strong>
-              </article>
-              <article>
-                <span>拥堵指数后</span>
-                <strong>{congestionAfterValue}</strong>
-              </article>
-            </div>
-            <ResponsiveContainer width="100%" height={150}>
-              <LineChart data={effectSeries}>
-                <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                <Tooltip />
-                <Line type="monotone" dataKey="before" stroke="#ff7d7d" strokeWidth={2} dot={false} />
-                <Line type="monotone" dataKey="after" stroke="#6ef2c2" strokeWidth={2} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
           </div>
         </section>
 
@@ -916,6 +1170,162 @@ function App() {
             <div className="panel-head">
               <h2>预测预警</h2>
               <div className="prediction-controls">
+                <select
+                  value={selectedDirection}
+                  onChange={(event) =>
+                    setSiteDirections((prev) => ({ ...prev, [selectedSite]: event.target.value }))
+                  }
+                >
+                  {(predictionOptions.find((item) => item.site_name === selectedSite)?.directions || []).map((direction) => (
+                    <option key={direction} value={direction}>
+                      {direction}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={selectedSite}
+                  onChange={(event) => {
+                    const nextSite = event.target.value;
+                    setSelectedSite(nextSite);
+                    const nextDirections = predictionOptions.find((item) => item.site_name === nextSite)?.directions || [];
+                    if (nextDirections.length) {
+                      setSiteDirections((prev) => ({ ...prev, [nextSite]: prev[nextSite] || nextDirections[0] }));
+                    }
+                  }}
+                >
+                  {predictionOptions.map((item) => (
+                    <option key={item.site_name} value={item.site_name}>
+                      {item.site_name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="prediction-plot prediction-plot--fresh">
+              <div className="prediction-weather-badge">
+                <span className="prediction-weather-icon">{weatherIcon(weather.iconKey || weather.headline)}</span>
+                <div className="prediction-weather-copy">
+                  <strong>{weather.headline}</strong>
+                  <span>{weather.breakdown}</span>
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={220}>
+                <AreaChart
+                  key={`${loadedPredictionContext.site}-${loadedPredictionContext.direction}-${loadedPredictionContext.end}-${predictionChartData.length}`}
+                  data={predictionChartData}
+                  margin={{ top: 8, right: 10, left: -18, bottom: 0 }}
+                >
+                  <defs>
+                    <linearGradient id="predictionFill" x1="0" x2="0" y1="0" y2="1">
+                      <stop offset="0%" stopColor="#5ecdfc" stopOpacity={0.35} />
+                      <stop offset="100%" stopColor="#5ecdfc" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: "#8da6bb", fontSize: 10 }} />
+                  <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} />
+                  <Tooltip content={<PredictionTooltip />} cursor={{ stroke: "rgba(114, 231, 255, 0.28)", strokeWidth: 1 }} />
+                  <Line type="monotone" dataKey="history" stroke="#4f8cf7" strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Area type="monotone" dataKey="predicted" stroke="none" fill="url(#predictionFill)" isAnimationActive={false} />
+                  <Line
+                    type="monotone"
+                    dataKey="predicted"
+                    stroke="#8f9dff"
+                    strokeWidth={2.3}
+                    dot={false}
+                    isAnimationActive
+                    animationDuration={700}
+                    animationEasing="ease-out"
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            <div className="prediction-legend">
+              <span><i className="legend-line history" /> 当前已有数据</span>
+              <span><i className="legend-line forecast" /> 未来 1 小时预测</span>
+            </div>
+
+            <div className="prediction-grid">
+              <div className="prediction-grid__card prediction-grid__card--metric">
+                <span>峰值</span>
+                <strong>{predictionStats.peak}</strong>
+              </div>
+              <div className="prediction-grid__card prediction-grid__card--metric">
+                <span>低值</span>
+                <strong>{predictionStats.low}</strong>
+              </div>
+              <div className="prediction-grid__card prediction-grid__card--metric">
+                <span>平均值</span>
+                <strong>{predictionStats.avg}</strong>
+              </div>
+            </div>
+            <div className="prediction-backtest-label">该时间点回看误差</div>
+            <div className="prediction-grid prediction-grid--secondary">
+              <div className="prediction-grid__card prediction-grid__card--wide">
+                <span>误差百分比</span>
+                <strong>{compareLoading ? "计算中..." : predictionCompare?.mape ? `${predictionCompare.mape}%` : "--"}</strong>
+              </div>
+              <div className="prediction-grid__card prediction-grid__card--wide">
+                <span>误差 MAE</span>
+                <strong>{compareLoading ? "计算中..." : predictionCompare?.mae ?? "--"}</strong>
+              </div>
+            </div>
+
+            <div className="reason-list">
+              {reasons.map((item) => (
+                <div key={item} className="reason-tag">
+                  {item}
+                </div>
+              ))}
+            </div>
+
+            <div className="model-note">
+              <span className="model-note__label">提示</span>
+              <span className="model-note__text">
+                当前预测基于历史交通流、速度、天气与时序特征生成未来一小时车流结果，按 10 分钟粒度展示。
+                模型：{predictionMeta?.model_type || "unavailable"}，测试集 MAE {predictionMeta?.test_mae ?? "--"}，RMSE {predictionMeta?.test_rmse ?? "--"}。
+              </span>
+            </div>
+          </div>
+        </aside>
+      </section>
+      {popupOpen && popupBeam ? (
+        <svg className="popup-beam-overlay" aria-hidden="true">
+          <defs>
+            <linearGradient id="popupBeamStroke" x1="0%" x2="100%" y1="0%" y2="0%">
+              <stop offset="0%" stopColor="rgba(115,231,255,0.95)" />
+              <stop offset="100%" stopColor="rgba(115,231,255,0.18)" />
+            </linearGradient>
+          </defs>
+          <circle className="popup-beam-overlay__node" cx={popupBeam.startX} cy={popupBeam.startY} r="5" />
+          <circle className="popup-beam-overlay__target" cx={popupBeam.targetX} cy={popupBeam.targetY} r="4" />
+          <path
+            className="popup-beam-overlay__path"
+            d={`M ${popupBeam.startX} ${popupBeam.startY} L ${popupBeam.elbowX} ${popupBeam.elbowY} L ${popupBeam.targetX} ${popupBeam.targetY}`}
+            pathLength="1"
+          />
+          <path
+            className="popup-beam-overlay__signal"
+            d={`M ${popupBeam.startX} ${popupBeam.startY} L ${popupBeam.elbowX} ${popupBeam.elbowY} L ${popupBeam.targetX} ${popupBeam.targetY}`}
+            pathLength="1"
+          />
+        </svg>
+      ) : null}
+
+      {popupOpen ? (
+        <div className="detail-popup" ref={popupRef}>
+          <div className="detail-popup__head">
+            <div className="detail-popup__title">
+              <strong>{selectedSite}</strong>
+            </div>
+            <button type="button" className="detail-popup__close" aria-label="关闭详情" onClick={() => setPopupOpen(false)}>
+              ×
+            </button>
+          </div>
+
+          <div className="detail-popup__toolbar">
+            <label className="popup-control">
+              <span>方向</span>
               <select
                 value={selectedDirection}
                 onChange={(event) =>
@@ -928,123 +1338,85 @@ function App() {
                   </option>
                 ))}
               </select>
-              <select
-                value={selectedSite}
-                onChange={(event) => {
-                  const nextSite = event.target.value;
-                  setSelectedSite(nextSite);
-                  const nextDirections = predictionOptions.find((item) => item.site_name === nextSite)?.directions || [];
-                  if (nextDirections.length) {
-                    setSiteDirections((prev) => ({ ...prev, [nextSite]: prev[nextSite] || nextDirections[0] }));
-                  }
-                }}
-              >
-                {predictionOptions.map((item) => (
-                  <option key={item.site_name} value={item.site_name}>
-                    {item.site_name}
+            </label>
+            <label className="popup-control">
+              <span>时间颗粒度</span>
+              <select value={popupIntervalMode} onChange={(event) => setPopupIntervalMode(event.target.value)}>
+                {INTERVAL_OPTIONS.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
                   </option>
                 ))}
               </select>
+            </label>
+          </div>
+
+          <div className="detail-charts">
+            <div className="mini-chart">
+              <div className="mini-chart__head">
+                <span>车流量</span>
               </div>
-            </div>
-            <div className="prediction-plot">
-              <ResponsiveContainer width="100%" height={220}>
-                <AreaChart data={predictionChartData} margin={{ top: 8, right: 10, left: -18, bottom: 0 }}>
-                  <defs>
-                    <linearGradient id="predictionFill" x1="0" x2="0" y1="0" y2="1">
-                      <stop offset="0%" stopColor="#5ecdfc" stopOpacity={0.35} />
-                      <stop offset="100%" stopColor="#5ecdfc" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
+              <ResponsiveContainer width="100%" height={136}>
+                <BarChart data={popupAnalysis} margin={{ top: 4, right: 24, left: -28, bottom: 0 }}>
                   <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
-                  <XAxis dataKey="label" tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                  <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="history" stroke="#4f8cf7" strokeWidth={2} dot={false} />
-                  <Area type="monotone" dataKey="predicted" stroke="#8f9dff" fill="url(#predictionFill)" strokeWidth={2.3} />
-                </AreaChart>
+                  <XAxis dataKey="bucket_start" tickFormatter={formatShortTime} tick={{ fill: "#8da6bb", fontSize: 10 }} />
+                  <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} domain={popupVehicleDomain} />
+                  <Tooltip content={<PopupChartTooltip />} cursor={{ fill: "rgba(114, 231, 255, 0.08)" }} />
+                  <Bar dataKey="vehicle_count" fill="#5ecdfc" radius={[4, 4, 0, 0]} />
+                </BarChart>
               </ResponsiveContainer>
-            </div>
-            <div className="prediction-legend">
-              <span><i className="legend-line history" /> 当前已有数据</span>
-              <span><i className="legend-line forecast" /> 未来 1 小时预测</span>
-            </div>
-
-            <div className="prediction-grid">
-              <div>
-                <span>峰值</span>
-                <strong>{predictionStats.peak}</strong>
-              </div>
-              <div>
-                <span>低值</span>
-                <strong>{predictionStats.low}</strong>
-              </div>
-              <div>
-                <span>平均值</span>
-                <strong>{predictionStats.avg}</strong>
-              </div>
-              <div>
-                <span>天气</span>
-                <strong>{weather}</strong>
-              </div>
-              <div>
-                <span>误差百分比</span>
-                <strong>{predictionCompare?.mape ? `${predictionCompare.mape}%` : "--"}</strong>
-              </div>
-              <div>
-                <span>误差 MAE</span>
-                <strong>{predictionCompare?.mae ?? "--"}</strong>
+              <div className="mini-chart__meta">
+                <span className="mini-chart__dot" />
+                <span>平均车流量 {selectedSummary?.avgVehicle || 0} 辆</span>
               </div>
             </div>
 
-            <div className="reason-list">
-              {reasons.map((item) => (
-                <div key={item} className="reason-tag">
-                  {item}
-                </div>
-              ))}
-            </div>
-
-            <div className="model-card">
-              <span>模型信息</span>
-              <strong>{predictionMeta?.model_type || "unavailable"}</strong>
-              <p>当前预测基于历史交通流、速度、天气与时序特征生成未来一小时车流结果，默认按 10 分钟粒度展示。</p>
-              <small>
-                测试集 MAE：{predictionMeta?.test_mae ?? "--"} · RMSE：{predictionMeta?.test_rmse ?? "--"}
-              </small>
+            <div className="mini-chart">
+              <div className="mini-chart__head">
+                <span>车速</span>
+              </div>
+              <ResponsiveContainer width="100%" height={136}>
+                <LineChart data={popupAnalysis} margin={{ top: 4, right: 24, left: -28, bottom: 0 }}>
+                  <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
+                  <XAxis dataKey="bucket_start" tickFormatter={formatShortTime} tick={{ fill: "#8da6bb", fontSize: 10 }} />
+                  <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} domain={popupSpeedDomain} />
+                  <Tooltip content={<PopupChartTooltip />} cursor={{ stroke: "rgba(114, 231, 255, 0.24)", strokeWidth: 1 }} />
+                  <Line type="monotone" dataKey="avg_speed" stroke="#7bf4cf" strokeWidth={2.2} dot={false} />
+                </LineChart>
+              </ResponsiveContainer>
+              <div className="mini-chart__meta">
+                <span className="mini-chart__dot" />
+                <span>平均车速 {selectedSummary?.avgSpeed || 0} km/h</span>
+              </div>
             </div>
           </div>
 
-          <div className="panel-frame">
-            <div className="panel-head">
-              <h2>重点监测</h2>
-              <span>当前时间段</span>
-            </div>
-            <div className="monitor-mini-list">
-              {monitorRows.slice(0, 5).map((item) => (
-                <button
-                  key={`${item.siteName}-${item.direction}`}
-                  type="button"
-                  className="mini-monitor"
-                  onClick={() => {
-                    setSelectedSite(item.siteName);
-                    setSiteDirections((prev) => ({ ...prev, [item.siteName]: item.direction }));
-                  }}
-                >
-                  <div>
-                    <strong>{item.siteName}</strong>
-                    <span>{item.direction}</span>
+          <div className="wheel-block">
+            <span>方向车流分布</span>
+            <div className="wheel-layout">
+              <ResponsiveContainer width="62%" height={124}>
+                <PieChart>
+                  <Pie data={directionPieData} dataKey="value" nameKey="name" innerRadius={24} outerRadius={46} cx="66%" cy="50%">
+                    {directionPieData.map((item, index) => (
+                      <Cell key={item.name} fill={PIE_COLORS[index % PIE_COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="wheel-legend">
+                {directionPieData.map((item, index) => (
+                  <div key={item.name}>
+                    <i style={{ backgroundColor: PIE_COLORS[index % PIE_COLORS.length] }} />
+                    <span>{item.name}</span>
+                    <strong>{item.value}</strong>
                   </div>
-                  <div>
-                    <em style={{ color: RISK_COLORS[item.risk] }}>{riskLabel(item.risk)}</em>
-                    <span>{item.avgVehicle}</span>
-                  </div>
-                </button>
-              ))}
+                ))}
+              </div>
             </div>
           </div>
-        </aside>
-      </section>
+        </div>
+      ) : null}
 
       {error ? <div className="status-toast status-toast--error">{error}</div> : null}
       {!error && loading ? <div className="status-toast">数据同步中...</div> : null}

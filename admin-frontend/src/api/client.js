@@ -52,14 +52,17 @@ export async function fetchDirectionRoutes() {
   return getCached("/api/direction-routes", undefined, 30 * 60 * 1000);
 }
 
+export async function fetchDirectionFlows(params) {
+  return getCached("/api/direction-flows", params);
+}
+
 export async function fetchWeather(params) {
   const { data } = await api.get("/api/weather", { params });
   return data;
 }
 
 export async function fetchPrediction(params) {
-  const { data } = await api.get("/api/prediction", { params });
-  return data;
+  return getCached("/api/prediction", params, 5 * 60 * 1000);
 }
 
 export async function fetchPredictionMeta() {
@@ -71,6 +74,10 @@ export async function fetchPredictionOptions() {
 }
 
 export async function fetchPredictionCompare(params) {
-  const { data } = await api.get("/api/prediction/compare", { params });
+  return getCached("/api/prediction/compare", params, 5 * 60 * 1000);
+}
+
+export async function postUserAlert(payload) {
+  const { data } = await api.post("/api/user-alerts", payload);
   return data;
 }
