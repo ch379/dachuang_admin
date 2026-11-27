@@ -1,5 +1,3 @@
-import { average } from "./adminHelpers";
-
 export function buildInterventionTargets(rows) {
   if (!rows?.length) return [];
 
@@ -61,16 +59,9 @@ export function buildInterventions(targets) {
         index === 0
           ? `该方向平均车流约 ${vehicleBase} 辆，建议将 ${target.direction} 方向绿灯临时增加 ${extensionSeconds} 秒，并同步压缩次方向 ${Math.max(4, Math.round(extensionSeconds * 0.6))} 秒。`
           : index === 1
-            ? `该方向平均车速约 ${speedBase} km/h，建议启动周边路口联动分流，预计提前引导约 ${diversion}% 车流绕行相邻通道。`
+            ? `该方向平均车速约 ${speedBase} km/h，建议启动周边路口联动分流，可试算将 ${diversion}% 车流分配到候选方向。`
             : `建议安排 1 组交警在 ${target.direction} 进口道现场疏导，连续 ${15 + index * 5} 分钟优先保障直行通行。`,
-      effectFactor: target.risk === "critical" ? 0.18 : target.risk === "high" ? 0.12 : 0.08,
-      effectText:
-        index === 0
-          ? `预计该方向排队长度下降 ${target.risk === "critical" ? 15 : target.risk === "high" ? 10 : 6}%`
-          : index === 1
-            ? `预计进入拥堵路段车辆减少 ${diversion}%`
-            : "预计现场通行恢复速度提升 10%",
-      actionLabel: "执行",
+      actionLabel: "标记建议",
     };
   });
 
@@ -88,22 +79,11 @@ export function buildInterventions(targets) {
           : index === 1
             ? `${target.siteName}${target.direction}方向通行压力较高，建议改走周边平行道路，避开当前路口。`
             : `${target.siteName}${target.direction}方向车速下降明显，如非必要请暂缓进入该路段并优先选择公共出行。`,
-      effectFactor: index === 0 ? 0.08 : 0.1,
-      effectText: index === 0 ? "预计削减瞬时汇入压力 8%" : "预计降低进入拥堵路段车辆 10%",
       actionLabel: "推送",
     };
   });
 
   return { agencyActions, userMessages };
-}
-
-export function buildEffectSeries(predictionRows, interventions) {
-  const factor = interventions.reduce((sum, item) => sum + (item.effectFactor || 0), 0);
-  return predictionRows.map((item, index) => {
-    const before = Number(item.predicted_vehicle_count) || 0;
-    const scale = Math.max(0.58, 1 - factor * 1.15 - index * 0.015);
-    return { label: item.timestamp, before, after: Math.round(before * scale) };
-  });
 }
 
 export function buildRiskReasons(summary, predictionStats) {
@@ -114,16 +94,4 @@ export function buildRiskReasons(summary, predictionStats) {
   if (predictionStats.peak >= 48) reasons.push(`预计 ${predictionStats.peakTime} 出现峰值压力`);
   if (!reasons.length) reasons.push("当前运行状态基本平稳");
   return reasons.slice(0, 3);
-}
-
-export function congestionIndex(avgVehicle, avgSpeed) {
-  return Math.max(1, Math.round((avgVehicle / Math.max(10, avgSpeed || 10)) * 12));
-}
-
-export function congestionAfter(effectSeries, fallback) {
-  if (!effectSeries.length) return fallback;
-  const before = average(effectSeries.map((item) => item.before));
-  const after = average(effectSeries.map((item) => item.after));
-  const ratio = before > 0 ? after / before : 1;
-  return Math.max(1, Math.round(fallback * ratio));
 }

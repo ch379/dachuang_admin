@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import MergeScenario from "./MergeScenario";
 import AMapLoader from "@amap/amap-jsapi-loader";
 import {
   Area,
@@ -19,8 +20,6 @@ import {
 import {
   fetchAnalysis,
   fetchDataRange,
-  fetchDatasetVersions,
-  getDatasetVersion,
   fetchDirectionRoutes,
   fetchDirectionFlows,
   fetchPrediction,
@@ -50,12 +49,9 @@ import {
   toInputTime,
 } from "./adminHelpers";
 import {
-  buildEffectSeries,
   buildInterventionTargets,
   buildInterventions,
   buildRiskReasons,
-  congestionAfter,
-  congestionIndex,
 } from "./adminModel";
 import "./App.css";
 import { FLOW_COLORS, flowDescription } from "./trafficMap";
@@ -223,22 +219,6 @@ function PopupChartTooltip({ active, payload, label }) {
   );
 }
 
-function EffectChartTooltip({ active, payload, label }) {
-  if (!active || !payload?.length) return null;
-
-  const before = payload.find((item) => item.dataKey === "before" && item.value != null);
-  const after = payload.find((item) => item.dataKey === "after" && item.value != null);
-  if (!before && !after) return null;
-
-  return (
-    <div className="prediction-tooltip">
-      <div className="prediction-tooltip__time">{label}</div>
-      {before ? <div className="prediction-tooltip__row">干预前预测：{before.value} 辆车</div> : null}
-      {after ? <div className="prediction-tooltip__row">干预后预测：{after.value} 辆车</div> : null}
-    </div>
-  );
-}
-
 function App() {
   const [amapKey, setAmapKey] = useState("");
   const [intersections, setIntersections] = useState([]);
@@ -257,8 +237,6 @@ function App() {
   const [pickerMonth, setPickerMonth] = useState("2025-09");
   const [siteDirections, setSiteDirections] = useState({});
   const [selectedSite, setSelectedSite] = useState("");
-  const [datasetVersions, setDatasetVersions] = useState([]);
-  const [datasetVersion, setDatasetVersion] = useState(getDatasetVersion);
   const [trafficRows, setTrafficRows] = useState([]);
   const [predictionRows, setPredictionRows] = useState([]);
   const [predictionCompare, setPredictionCompare] = useState(null);
@@ -291,13 +269,6 @@ function App() {
       setLoading(true);
       setError("");
       try {
-        const versions = await fetchDatasetVersions();
-        const preferred = getDatasetVersion();
-        const selected = versions.find((item) => item.version_id === preferred) || versions[0];
-        if (selected) {
-          localStorage.setItem("trafficDatasetVersion", selected.version_id);
-          setDatasetVersion(selected.version_id);
-        }
         const [config, range, routeData, options, meta] = await Promise.all([
           fetchPublicConfig(),
           fetchDataRange(),
@@ -319,7 +290,6 @@ function App() {
         setRoutes(routeData || []);
         setPredictionOptions(options || []);
         setPredictionMeta(meta);
-        setDatasetVersions(versions || []);
         setTimeLimit({ min, max });
         setStartInput(initialRange.start);
         setEndInput(initialRange.end);
@@ -476,23 +446,7 @@ function App() {
     () => buildInterventions(selectedInterventionTarget ? [selectedInterventionTarget] : []),
     [selectedInterventionTarget]
   );
-  const allInterventionEffects = useMemo(
-    () => [...(interventions.agencyActions || []), ...(interventions.userMessages || [])],
-    [interventions]
-  );
-  const appliedInterventionEffects = useMemo(
-    () => allInterventionEffects.filter((item) => executedActions[item.id]),
-    [allInterventionEffects, executedActions]
-  );
   const activeInterventionTargetId = selectedInterventionTargetId;
-  const effectSeries = useMemo(
-    () =>
-      buildEffectSeries(predictionRows, appliedInterventionEffects).map((item) => ({
-        ...item,
-        label: formatShortTime(item.label),
-      })),
-    [predictionRows, appliedInterventionEffects]
-  );
   const reasons = useMemo(
     () => buildRiskReasons(selectedSummary, predictionStats),
     [selectedSummary, predictionStats]
@@ -513,15 +467,6 @@ function App() {
     () => buildWeatherBadge(trafficRows, loadedPredictionContext.site, loadedPredictionContext.direction),
     [trafficRows, loadedPredictionContext]
   );
-  const congestionBefore = useMemo(
-    () => congestionIndex(selectedSummary?.avgVehicle || 0, selectedSummary?.avgSpeed || 40),
-    [selectedSummary]
-  );
-  const congestionAfterValue = useMemo(
-    () => congestionAfter(effectSeries, congestionBefore),
-    [effectSeries, congestionBefore]
-  );
-
   useEffect(() => {
     setExecutedActions({});
     setSelectedInterventionTargetId("");
@@ -766,21 +711,23 @@ function App() {
   }
 
   function runAction(action) {
+    if (!action.message) {
+      setExecutedActions((prev) => ({ ...prev, [action.id]: "已标记" }));
+      return;
+    }
     setExecutedActions((prev) => ({ ...prev, [action.id]: "执行中" }));
     window.setTimeout(async () => {
       try {
-        if (action.message) {
-          await postUserAlert({
-            title: `${action.siteName || selectedSite || "当前路口"}出行提醒`,
-            message: action.message,
-            site_name: action.siteName || selectedSite || null,
-            direction: action.direction || selectedDirection || null,
-            start_time: appliedRange.start ? toApiTime(appliedRange.start) : null,
-            end_time: appliedRange.end ? toApiTime(appliedRange.end) : null,
-            action_label: action.actionLabel || "推送",
-          });
-        }
-        setExecutedActions((prev) => ({ ...prev, [action.id]: action.message ? "已推送" : "已下发" }));
+        await postUserAlert({
+          title: `${action.siteName || selectedSite || "当前路口"}出行提醒`,
+          message: action.message,
+          site_name: action.siteName || selectedSite || null,
+          direction: action.direction || selectedDirection || null,
+          start_time: appliedRange.start ? toApiTime(appliedRange.start) : null,
+          end_time: appliedRange.end ? toApiTime(appliedRange.end) : null,
+          action_label: action.actionLabel || "推送",
+        });
+        setExecutedActions((prev) => ({ ...prev, [action.id]: "已推送" }));
       } catch (runError) {
         setExecutedActions((prev) => ({ ...prev, [action.id]: "失败" }));
         setError(`消息下发失败：${runError.message}`);
@@ -812,12 +759,6 @@ function App() {
       </header>
 
       <section className="top-control-row">
-        <label className="dataset-version-control" style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span>数据版本</span>
-          <select value={datasetVersion} onChange={(event) => { const value = event.target.value; setDatasetVersion(value); localStorage.setItem("trafficDatasetVersion", value); window.location.reload(); }}>
-            {datasetVersions.map((item) => <option key={item.version_id} value={item.version_id}>{item.display_name}</option>)}
-          </select>
-        </label>
         <div className="road-cards">
           {siteStats.map((item) => (
             <div
@@ -1073,7 +1014,6 @@ function App() {
                             <i className="action-row__dot" />
                             <div className="action-row__copy">
                               <p>{item.reason}</p>
-                              <small>{item.effectText}</small>
                             </div>
                           </div>
                           <div className="action-row__side">
@@ -1099,7 +1039,6 @@ function App() {
                             <i className="action-row__dot" />
                             <div className="action-row__copy">
                               <p>{item.message}</p>
-                              <small>{item.effectText}</small>
                             </div>
                           </div>
                           <div className="action-row__side">
@@ -1117,63 +1056,7 @@ function App() {
               </div>
             ) : null}
 
-            <div className="intervention-effect">
-              <div className="panel-head intervention-effect__head">
-                <h2>干预结果预测</h2>
-                <span>未来 1 小时干预前后对比</span>
-              </div>
-              <div className="effect-summary">
-                <article>
-                  <span>执行策略数</span>
-                  <strong>{Object.keys(executedActions).length}</strong>
-                </article>
-                <article>
-                  <span>拥堵指数前</span>
-                  <strong>{congestionBefore}</strong>
-                </article>
-                <article>
-                  <span>拥堵指数后</span>
-                  <strong>{congestionAfterValue}</strong>
-                </article>
-              </div>
-              <ResponsiveContainer width="100%" height={150}>
-                <LineChart
-                  key={`${Object.keys(executedActions).sort().join("|")}-${effectSeries.length}`}
-                  data={effectSeries}
-                  margin={{ top: 8, right: 28, left: -18, bottom: 0 }}
-                >
-                  <CartesianGrid stroke="rgba(148,163,184,0.14)" vertical={false} />
-                  <XAxis dataKey="label" tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                  <YAxis tick={{ fill: "#8da6bb", fontSize: 10 }} />
-                  <Tooltip content={<EffectChartTooltip />} cursor={{ stroke: "rgba(114, 231, 255, 0.24)", strokeWidth: 1 }} />
-                  <Line
-                    type="monotone"
-                    dataKey="before"
-                    stroke="#ff6b6b"
-                    strokeWidth={2.2}
-                    dot={false}
-                    isAnimationActive={false}
-                  />
-                  {appliedInterventionEffects.length ? (
-                    <Line
-                      type="monotone"
-                      dataKey="after"
-                      stroke="#57efb2"
-                      strokeWidth={2.4}
-                      dot={false}
-                      isAnimationActive
-                      animationDuration={420}
-                    />
-                  ) : null}
-                </LineChart>
-              </ResponsiveContainer>
-              <div className="prediction-legend intervention-effect__legend">
-                <span><i className="legend-line intervention-before" /> 红线：干预前预测</span>
-                {appliedInterventionEffects.length ? (
-                  <span><i className="legend-line intervention-after" /> 绿线：干预后预测</span>
-                ) : null}
-              </div>
-            </div>
+            <MergeScenario options={predictionOptions} timeLimit={timeLimit} />
           </div>
         </aside>
 

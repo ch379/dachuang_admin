@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -6,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db, init_db
+from app.merge_scenario import DEFAULT_RECEIVER, simulate_merge
+from ml.versioned_inference import VERSION
 from app.schemas import (
     AnalysisPoint,
     DataTimeRange,
@@ -235,6 +238,27 @@ def direction_flows(
         if dataset_version != "旧版":
             return get_versioned_direction_flows(dataset_version, start_time, end_time)
         return get_direction_flows(db, start_time, end_time)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/merge-scenario")
+def merge_scenario(
+    start: datetime = Query(default=datetime(2025, 10, 20, 8)),
+    receiver_site: str = Query(default=DEFAULT_RECEIVER[0]),
+    receiver_direction: str = Query(default=DEFAULT_RECEIVER[1]),
+    diversion_percent: float = Query(default=10, ge=0, le=100),
+    ramp_share_percent: float = Query(default=50, ge=0, le=100),
+    lag_minutes: int = Query(default=5, ge=0, le=30, multiple_of=5),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        return simulate_merge(
+            db, VERSION, start, (receiver_site, receiver_direction),
+            diversion_percent, ramp_share_percent, lag_minutes,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="本地缺少合流区下游观测文件。") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

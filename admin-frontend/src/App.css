@@ -287,3 +287,15 @@ select option { color: #dcebf5; background: #0d1c2c; }
 .map-node { width: 14px; height: 14px; }
 .map-node__core { width: 7px; height: 7px; border: 2px solid #dbeaf4; box-shadow: 0 1px 5px rgba(0,0,0,.3); }
 .map-marker__label { font-size: 10px; bottom: 19px; padding: 3px 7px; }
+
+.merge-scenario { border-top: 1px solid rgba(130,200,255,.18); margin-top: 14px; padding-top: 10px; }
+.merge-scenario p, .merge-scenario label, .merge-scenario caption { color: #aac3d7; font-size: 12px; line-height: 1.45; }
+.merge-scenario [role="alert"] { color: #ffadab; }
+.merge-scenario__fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.merge-scenario__fields label { display: grid; gap: 4px; }
+.merge-scenario__fields label:nth-child(-n+2) { grid-column: 1 / -1; }
+.merge-scenario :is(input, select) { width: 100%; min-width: 0; padding: 5px; color: #e4f0f8; background: #102637; border: 1px solid #385469; border-radius: 4px; color-scheme: dark; }
+.merge-scenario table { width: 100%; margin-top: 12px; border-collapse: collapse; font-size: 12px; }
+.merge-scenario caption { text-align: left; padding-bottom: 4px; }
+.merge-scenario :is(th, td) { border-bottom: 1px solid rgba(130,200,255,.15); padding: 5px 3px; text-align: right; }
+.merge-scenario th:first-child { text-align: left; }
