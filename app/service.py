@@ -8,7 +8,7 @@ from threading import Lock
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-from sqlalchemy import Select, and_, delete, func, select, text
+from sqlalchemy import Select, and_, delete, func, inspect, select, text
 from sqlalchemy.orm import Session
 
 from app.cache import ttl_cache
@@ -243,16 +243,23 @@ def load_route_cardinal_map() -> Dict[str, Dict[str, Tuple[float, float]]]:
 
 @lru_cache(maxsize=1)
 def load_direction_routes() -> List[DirectionRoute]:
+    override_file = Path(__file__).with_name("map_route_overrides.json")
+    overrides = json.loads(override_file.read_text(encoding="utf-8"))
+    routes = [
+        DirectionRoute(
+            site_name=site_name,
+            direction=direction,
+            path=[RoutePoint(longitude=lng, latitude=lat) for lng, lat in points],
+        )
+        for site_name, directions in overrides.items()
+        for direction, points in directions.items()
+    ]
     xlsx_path = Path("11.xlsx")
     if not xlsx_path.exists():
-        return []
+        return routes
 
     df = pd.read_excel(xlsx_path, sheet_name="Sheet1", header=None)
     direction_names = {"北向南", "南向北", "东向西", "西向东"}
-    routes: List[DirectionRoute] = []
-    # Display geometry traced against the current AMap basemap for surveyed roads.
-    override_file = Path(__file__).with_name("map_route_overrides.json")
-    overrides = json.loads(override_file.read_text(encoding="utf-8"))
 
     row_idx = 0
     while row_idx < len(df) - 1:
@@ -262,14 +269,13 @@ def load_direction_routes() -> List[DirectionRoute]:
             site_name = _normalize_road_name(site_name_raw.strip())
             next_row = df.iloc[row_idx + 1]
             for col_idx, header in enumerate(row.tolist()):
-                if header not in direction_names:
+                if header not in direction_names or header in overrides.get(site_name, {}):
                     continue
                 raw_path = next_row.iloc[col_idx]
                 if not isinstance(raw_path, str) or not raw_path.strip():
                     continue
                 points = [_parse_point(part.strip()) for part in raw_path.split(";")]
-                survey_path = overrides.get(site_name, {}).get(header)
-                clean_points = survey_path or _clean_path([pt for pt in points if pt is not None])
+                clean_points = _clean_path([pt for pt in points if pt is not None])
                 if len(clean_points) < 2:
                     continue
                 routes.append(
@@ -360,7 +366,7 @@ def _apply_filters(
     return stmt
 
 
-def list_intersections(db: Session) -> List[IntersectionPoint]:
+def list_intersections(db: Session, dataset_version: str = "旧版") -> List[IntersectionPoint]:
     settings = get_settings()
     known = settings.key_intersections
     anchors = load_route_anchor_map()
@@ -374,7 +380,8 @@ def list_intersections(db: Session) -> List[IntersectionPoint]:
     data: List[IntersectionPoint] = []
     for name in sorted(names):
         lng, lat = anchors.get(name, known.get(name, (0.0, 0.0)))
-        data.append(IntersectionPoint(site_name=name, longitude=lng, latitude=lat))
+        site = _versioned_road_name(name) if dataset_version != "旧版" else name
+        data.append(IntersectionPoint(site_name=site, longitude=lng, latitude=lat))
     return data
 
 
@@ -394,16 +401,38 @@ def get_traffic_data(
 _DIRECTION_NAMES = {"E2W": "东向西", "W2E": "西向东", "N2S": "北向南", "S2N": "南向北"}
 
 
-def _version_exists(version: str) -> None:
+_VERSIONED_SITE_NAMES = {
+    "恒福路": "恒福路交叉口",
+    "星光大道北延申段": "星光大道北延伸段",
+    "星峰路康田路交叉口": "星峰路—康田路交叉口",
+}
+
+
+def _versioned_road_name(road_name: Optional[str]) -> Optional[str]:
+    normalized = _normalize_road_name(road_name)
+    return _VERSIONED_SITE_NAMES.get(normalized, normalized)
+
+
+def list_dataset_versions(db: Session) -> list[dict]:
+    if not inspect(db.connection()).has_table("traffic_dataset_version"):
+        return [{"version_id": "旧版", "display_name": "旧版交通数据"}]
+    rows = db.execute(text(
+        "SELECT version_id, display_name FROM traffic_dataset_version "
+        "ORDER BY CASE WHEN version_id='旧版' THEN 0 ELSE 1 END, version_id"
+    )).mappings()
+    return [dict(row) for row in rows]
+
+
+def require_dataset_version(version: str) -> None:
     with SessionLocal() as db:
-        found = db.execute(text("SELECT 1 FROM traffic_dataset_version WHERE version_id=:v"), {"v": version}).first()
+        found = any(row["version_id"] == version for row in list_dataset_versions(db))
     if not found:
         raise ValueError(f"Unknown dataset version: {version}")
 
 
 def get_versioned_traffic_data(version: str, start_time: Optional[str], end_time: Optional[str],
                                road_name: Optional[str], direction: Optional[str], limit: int) -> List[TrafficRecord]:
-    _version_exists(version)
+    require_dataset_version(version)
     sql = "SELECT timestamp, site_name, direction, flow_5min, avg_speed_site_kmh, weather, tmax_c, tmin_c FROM traffic_approach_observation WHERE dataset_version=:v"
     params: dict = {"v": version}
     if start_time:
@@ -411,7 +440,7 @@ def get_versioned_traffic_data(version: str, start_time: Optional[str], end_time
     if end_time:
         sql += " AND timestamp <= :end"; params["end"] = normalize_ts(end_time).isoformat(sep=" ")
     if road_name:
-        sql += " AND site_name=:site"; params["site"] = _normalize_road_name(road_name)
+        sql += " AND site_name=:site"; params["site"] = _versioned_road_name(road_name)
     if direction:
         sql += " AND direction=:direction"; params["direction"] = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
     sql += " ORDER BY timestamp DESC LIMIT :limit"; params["limit"] = limit
@@ -422,7 +451,7 @@ def get_versioned_traffic_data(version: str, start_time: Optional[str], end_time
 
 def get_versioned_analysis_data(version: str, start_time: str, end_time: str, interval_minutes: int,
                                 road_name: Optional[str], direction: Optional[str]) -> List[AnalysisPoint]:
-    _version_exists(version)
+    require_dataset_version(version)
     start_ts, end_ts = normalize_ts(start_time), normalize_ts(end_time)
     allowed = (10, 20, 30, 60, 120, 180, 240, 360, 720, 1440)
     if not start_ts or not end_ts or end_ts < start_ts or interval_minutes not in allowed:
@@ -430,7 +459,7 @@ def get_versioned_analysis_data(version: str, start_time: str, end_time: str, in
     sql = "SELECT timestamp, flow_5min, avg_speed_site_kmh FROM traffic_approach_observation WHERE dataset_version=:v AND timestamp>=:start AND timestamp<=:end AND data_valid_flag=1"
     params: dict = {"v": version, "start": start_ts.isoformat(sep=" "), "end": end_ts.isoformat(sep=" ")}
     if road_name:
-        sql += " AND site_name=:site"; params["site"] = _normalize_road_name(road_name)
+        sql += " AND site_name=:site"; params["site"] = _versioned_road_name(road_name)
     if direction:
         sql += " AND direction=:direction"; params["direction"] = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
     with SessionLocal() as db:
@@ -444,7 +473,7 @@ def get_versioned_analysis_data(version: str, start_time: str, end_time: str, in
 
 
 def get_versioned_data_range(version: str) -> DataTimeRange:
-    _version_exists(version)
+    require_dataset_version(version)
     with SessionLocal() as db:
         row = db.execute(text("SELECT MIN(timestamp), MAX(timestamp) FROM traffic_approach_observation WHERE dataset_version=:v"), {"v":version}).first()
     if not row or not row[0] or not row[1]:
@@ -453,7 +482,7 @@ def get_versioned_data_range(version: str) -> DataTimeRange:
 
 
 def get_versioned_direction_flows(version: str, start_time: str, end_time: str) -> List[DirectionFlow]:
-    _version_exists(version)
+    require_dataset_version(version)
     start, end = normalize_ts(start_time), normalize_ts(end_time)
     if start is None or end is None or start >= end:
         raise ValueError("start_time must be earlier than end_time")
@@ -565,39 +594,58 @@ def get_prediction_data(
 
 def get_versioned_prediction_data(version: str, time_range: Optional[str], road_name: Optional[str], direction: Optional[str]) -> List[PredictionRecord]:
     from ml.versioned_inference import predict_versioned
-    _version_exists(version)
+    require_dataset_version(version)
     ts = align_to_ten_minutes_floor(normalize_ts(time_range))
-    site = _normalize_road_name(road_name)
+    site = _versioned_road_name(road_name)
     if not site or not direction:
         raise ValueError("road_name and direction are required for prediction.")
     code = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
     predicted = predict_versioned(version, site, code, ts.strftime("%Y-%m-%d %H:%M:%S") if ts else None)
-    return [PredictionRecord(timestamp=t, site_name=site, approach=direction, predicted_vehicle_count=n) for t,n in predicted]
+    if not predicted:
+        raise ValueError("Prediction model is unavailable or the required traffic history is incomplete.")
+    return [PredictionRecord(timestamp=t, site_name=site, approach=_DIRECTION_NAMES.get(code, code), predicted_vehicle_count=n) for t, n in predicted]
 
 
 def get_versioned_prediction_compare(version: str, time_range: str, road_name: str, direction: str) -> PredictionCompareSummary:
     predicted = get_versioned_prediction_data(version, time_range, road_name, direction)
-    if not predicted:
-        raise ValueError("Prediction model is not ready or no history is available for this road and direction.")
     code = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
+    first_sample = predicted[0].timestamp + timedelta(minutes=5)
+    last_sample = predicted[-1].timestamp + timedelta(minutes=10)
     with SessionLocal() as db:
         rows = db.execute(text(
             "SELECT timestamp, flow_5min FROM traffic_approach_observation WHERE dataset_version=:v "
             "AND site_name=:site AND direction=:direction AND data_valid_flag=1 "
             "AND timestamp>=:start AND timestamp<=:end"
-        ), {"v":version, "site":_normalize_road_name(road_name), "direction":code,
-            "start":predicted[0].timestamp.strftime("%Y-%m-%d %H:%M:%S"), "end":predicted[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S")}).mappings().all()
-    actual = {datetime.fromisoformat(r["timestamp"]): int(r["flow_5min"] or 0) for r in rows}
-    points=[]; errors=[]; sq=[]; ape=[]
-    for p in predicted:
-        if p.timestamp not in actual:
+        ), {
+            "v": version, "site": predicted[0].site_name, "direction": code,
+            "start": first_sample.isoformat(sep=" "), "end": last_sample.isoformat(sep=" "),
+        }).mappings().all()
+
+    actual = {datetime.fromisoformat(row["timestamp"]): row["flow_5min"] for row in rows}
+    points = []
+    percent_errors = []
+    for record in predicted:
+        # The chart labels each bucket by its start; the forecast averages its next two samples.
+        first = actual.get(record.timestamp + timedelta(minutes=5))
+        second = actual.get(record.timestamp + timedelta(minutes=10))
+        if first is None or second is None:
             continue
-        err=abs(p.predicted_vehicle_count-actual[p.timestamp]); errors.append(err); sq.append(err**2)
-        if actual[p.timestamp]: ape.append(err/actual[p.timestamp]*100)
-        points.append(PredictionComparePoint(timestamp=p.timestamp, predicted_vehicle_count=p.predicted_vehicle_count, actual_vehicle_count=actual[p.timestamp], abs_error=err))
+        observed = int(round((first + second) / 2))
+        error = abs(record.predicted_vehicle_count - observed)
+        if observed:
+            percent_errors.append(error / observed * 100)
+        points.append(PredictionComparePoint(
+            timestamp=record.timestamp, predicted_vehicle_count=record.predicted_vehicle_count,
+            actual_vehicle_count=observed, abs_error=error,
+        ))
     if not points:
         raise ValueError("No actual observations overlap the prediction horizon.")
-    return PredictionCompareSummary(mae=sum(errors)/len(errors), rmse=(sum(sq)/len(sq))**0.5, mape=sum(ape)/len(ape) if ape else 0, points=points)
+    return PredictionCompareSummary(
+        mae=sum(point.abs_error for point in points) / len(points),
+        rmse=(sum(point.abs_error ** 2 for point in points) / len(points)) ** 0.5,
+        mape=sum(percent_errors) / len(percent_errors) if percent_errors else 0,
+        points=points,
+    )
 
 
 @ttl_cache(seconds=300, maxsize=512)
@@ -716,11 +764,11 @@ def list_prediction_options(db: Session) -> List[PredictionOption]:
 
 
 def list_versioned_prediction_options(version: str) -> List[PredictionOption]:
-    _version_exists(version)
+    require_dataset_version(version)
     with SessionLocal() as db:
         rows = db.execute(text(
             "SELECT DISTINCT site_name, direction FROM traffic_approach_observation "
-            "WHERE dataset_version=:v ORDER BY site_name, direction"
+            "WHERE dataset_version=:v AND data_valid_flag=1 ORDER BY site_name, direction"
         ), {"v":version}).all()
     grouped: Dict[str, List[str]] = {}
     for site, direction in rows:
@@ -969,8 +1017,14 @@ def _get_data_time_range_cached() -> DataTimeRange:
     )
 
 
-def get_direction_routes() -> List[DirectionRoute]:
-    return load_direction_routes()
+def get_direction_routes(dataset_version: str = "旧版") -> List[DirectionRoute]:
+    routes = load_direction_routes()
+    if dataset_version == "旧版":
+        return routes
+    return [
+        route.model_copy(update={"site_name": _versioned_road_name(route.site_name)})
+        for route in routes
+    ]
 
 
 def _cleanup_user_alerts(now: Optional[datetime] = None) -> None:

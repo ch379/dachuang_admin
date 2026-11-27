@@ -42,6 +42,8 @@ from app.service import (
     get_weather,
     list_user_alerts,
     list_prediction_options,
+    list_dataset_versions,
+    require_dataset_version,
     list_intersections,
 )
 
@@ -70,29 +72,21 @@ def on_startup() -> None:
 
 
 @app.get("/api/config/public", response_model=PublicConfig)
-def get_public_config(db: Session = Depends(get_db)) -> PublicConfig:
+def get_public_config(dataset_version: str = Query(default="旧版"), db: Session = Depends(get_db)) -> PublicConfig:
     return PublicConfig(
         amap_api_key=settings.effective_amap_js_key,
-        intersections=list_intersections(db),
+        intersections=list_intersections(db, dataset_version),
     )
 
 
 @app.get("/api/intersections", response_model=List[IntersectionPoint])
-def intersections(db: Session = Depends(get_db)) -> List[IntersectionPoint]:
-    return list_intersections(db)
+def intersections(dataset_version: str = Query(default="旧版"), db: Session = Depends(get_db)) -> List[IntersectionPoint]:
+    return list_intersections(db, dataset_version)
 
 
 @app.get("/api/dataset-versions")
-def dataset_versions() -> list[dict]:
-    from sqlalchemy import text
-    from app.db import engine
-
-    with engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT version_id, display_name FROM traffic_dataset_version "
-            "ORDER BY CASE WHEN version_id='旧版' THEN 0 ELSE 1 END, version_id"
-        )).mappings().all()
-    return [dict(row) for row in rows]
+def dataset_versions(db: Session = Depends(get_db)) -> list[dict]:
+    return list_dataset_versions(db)
 
 
 @app.get("/api/traffic", response_model=List[TrafficRecord])
@@ -142,17 +136,26 @@ def prediction(
 
 @app.get("/api/prediction/meta", response_model=PredictionMeta)
 def prediction_meta(dataset_version: str = Query(default="旧版")) -> PredictionMeta:
-    if dataset_version != "旧版":
-        from ml.versioned_inference import get_version_model_meta
-        return PredictionMeta(**get_version_model_meta(dataset_version))
-    return PredictionMeta(**get_prediction_meta())
+    if dataset_version == "旧版":
+        return PredictionMeta(**get_prediction_meta())
+
+    from ml.versioned_inference import get_version_model_meta
+
+    try:
+        require_dataset_version(dataset_version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PredictionMeta(**get_version_model_meta(dataset_version))
 
 
 @app.get("/api/prediction/options", response_model=List[PredictionOption])
 def prediction_options(dataset_version: str = Query(default="旧版"), db: Session = Depends(get_db)) -> List[PredictionOption]:
-    if dataset_version != "旧版":
+    if dataset_version == "旧版":
+        return list_prediction_options(db)
+    try:
         return list_versioned_prediction_options(dataset_version)
-    return list_prediction_options(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/prediction/compare", response_model=PredictionCompareSummary)
@@ -220,8 +223,8 @@ def data_range(dataset_version: str = Query(default="旧版"), db: Session = Dep
 
 
 @app.get("/api/direction-routes", response_model=List[DirectionRoute])
-def direction_routes() -> List[DirectionRoute]:
-    return get_direction_routes()
+def direction_routes(dataset_version: str = Query(default="旧版")) -> List[DirectionRoute]:
+    return get_direction_routes(dataset_version)
 
 
 @app.get("/api/direction-flows", response_model=List[DirectionFlow])

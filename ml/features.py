@@ -40,7 +40,9 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def build_tabular_features(df: pd.DataFrame, lookback_steps: int = 24) -> pd.DataFrame:
+def build_tabular_features(
+    df: pd.DataFrame, lookback_steps: int = 24, *, include_target: bool = True
+) -> pd.DataFrame:
     frame = add_time_features(df)
     frame = frame.sort_values(["site_name", "approach", "timestamp"]).copy()
     group_cols = ["site_name", "approach"]
@@ -73,7 +75,8 @@ def build_tabular_features(df: pd.DataFrame, lookback_steps: int = 24) -> pd.Dat
     frame["delta_1_12"] = frame["lag_1"] - frame["lag_12"]
     frame["delta_1_24"] = frame["lag_1"] - frame["lag_24"]
     frame["delta_day"] = frame["lag_1"] - frame["lag_288"]
-    frame["target"] = frame.groupby(group_cols)["vehicle_count"].shift(-1)
+    if include_target:
+        frame["target"] = frame.groupby(group_cols)["vehicle_count"].shift(-1)
     return frame.dropna().reset_index(drop=True)
 
 

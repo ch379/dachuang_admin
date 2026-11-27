@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AMapLoader from "@amap/amap-jsapi-loader";
 import {
   Area,
@@ -20,6 +20,7 @@ import {
   fetchAnalysis,
   fetchDataRange,
   fetchDatasetVersions,
+  getDatasetVersion,
   fetchDirectionRoutes,
   fetchDirectionFlows,
   fetchPrediction,
@@ -257,7 +258,7 @@ function App() {
   const [siteDirections, setSiteDirections] = useState({});
   const [selectedSite, setSelectedSite] = useState("");
   const [datasetVersions, setDatasetVersions] = useState([]);
-  const [datasetVersion, setDatasetVersion] = useState(localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20");
+  const [datasetVersion, setDatasetVersion] = useState(getDatasetVersion);
   const [trafficRows, setTrafficRows] = useState([]);
   const [predictionRows, setPredictionRows] = useState([]);
   const [predictionCompare, setPredictionCompare] = useState(null);
@@ -290,13 +291,19 @@ function App() {
       setLoading(true);
       setError("");
       try {
-        const [config, range, routeData, options, meta, versions] = await Promise.all([
+        const versions = await fetchDatasetVersions();
+        const preferred = getDatasetVersion();
+        const selected = versions.find((item) => item.version_id === preferred) || versions[0];
+        if (selected) {
+          localStorage.setItem("trafficDatasetVersion", selected.version_id);
+          setDatasetVersion(selected.version_id);
+        }
+        const [config, range, routeData, options, meta] = await Promise.all([
           fetchPublicConfig(),
           fetchDataRange(),
           fetchDirectionRoutes(),
           fetchPredictionOptions(),
           fetchPredictionMeta(),
-          fetchDatasetVersions(),
         ]);
 
         const min = toInputTime(range.min_timestamp);
@@ -331,6 +338,15 @@ function App() {
   }, []);
 
   const selectedDirection = useMemo(() => siteDirections[selectedSite] || "", [siteDirections, selectedSite]);
+
+  const selectMapSite = useCallback((siteName, direction) => {
+    const available = predictionOptions.find((item) => item.site_name === siteName)?.directions || [];
+    setSelectedSite(siteName);
+    setSiteDirections((previous) => ({
+      ...previous,
+      [siteName]: [direction, previous[siteName], available[0]].find((item) => available.includes(item)) || "",
+    }));
+  }, [predictionOptions]);
 
   useEffect(() => {
     if (!appliedRange.start || !appliedRange.end || !selectedSite || !selectedDirection) return;
@@ -575,13 +591,15 @@ function App() {
     const flowMap = new Map(directionFlows.map((item) => [`${item.site_name}|${item.direction}`, item]));
 
     intersections.forEach((site) => {
-      const flow = flowMap.get(`${site.site_name}|${siteDirections[site.site_name]}`);
+      const siteName = site.site_name;
+      const siteDirection = siteDirections[siteName] || predictionOptions.find((item) => item.site_name === siteName)?.directions?.[0];
+      const flow = flowMap.get(`${siteName}|${siteDirection}`);
       const color = FLOW_COLORS[flow?.level || "unknown"];
       const marker = new AMap.Marker({
         position: [site.longitude, site.latitude],
         anchor: "bottom-center",
         content: `
-          <div class="map-marker ${selectedSite === site.site_name ? "active" : ""}">
+          <div class="map-marker ${selectedSite === siteName ? "active" : ""}">
             <div class="map-marker__label">${site.site_name}</div>
             <div class="map-node">
               <span class="map-node__core" style="background:${color}"></span>
@@ -590,7 +608,7 @@ function App() {
         `,
       });
       marker.on("click", () => {
-        setSelectedSite(site.site_name);
+        selectMapSite(site.site_name);
         setPopupOpen(true);
       });
       marker.setMap(mapRef.current);
@@ -599,8 +617,9 @@ function App() {
 
     routes.forEach((route) => {
       if (route.path.length < 2) return;
-      const flow = flowMap.get(`${route.site_name}|${route.direction}`);
-      const highlighted = route.site_name === selectedSite && route.direction === selectedDirection;
+      const routeSite = route.site_name;
+      const flow = flowMap.get(`${routeSite}|${route.direction}`);
+      const highlighted = routeSite === selectedSite && route.direction === selectedDirection;
       const polyline = new AMap.Polyline({
         path: route.path.map(({ longitude, latitude }) => [longitude, latitude]),
         strokeColor: FLOW_COLORS[flow?.level || "unknown"],
@@ -610,11 +629,10 @@ function App() {
         lineJoin: "round",
         showDir: flow?.average_count > 0,
         zIndex: highlighted ? 65 : 60,
-        extData: { site: route.site_name, direction: route.direction, flow },
+        extData: { site: routeSite, direction: route.direction, flow },
       });
       polyline.on("click", () => {
-        setSelectedSite(route.site_name);
-        setSiteDirections((previous) => ({ ...previous, [route.site_name]: route.direction }));
+        selectMapSite(route.site_name, route.direction);
         setPopupOpen(true);
       });
       polyline.on("mouseover", () => {
@@ -624,7 +642,7 @@ function App() {
       polyline.setMap(mapRef.current);
       overlaysRef.current.push(polyline);
     });
-  }, [intersections, routes, directionFlows, siteDirections, selectedSite, selectedDirection, mapReady]);
+  }, [intersections, routes, directionFlows, siteDirections, selectedSite, selectedDirection, mapReady, predictionOptions, selectMapSite]);
 
   useEffect(() => {
     if (!popupOpen || !selectedSite || !mapRef.current || !popupRef.current || !mapContainerRef.current) {
