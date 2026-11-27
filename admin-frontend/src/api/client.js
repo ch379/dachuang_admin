@@ -35,17 +35,21 @@ export async function fetchPublicConfig() {
 }
 
 export async function fetchTraffic(params) {
-  const { data } = await api.get("/api/traffic", { params });
+  const { data } = await api.get("/api/traffic", { params: { ...params, dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" } });
   return data;
 }
 
 export async function fetchAnalysis(params) {
-  const { data } = await api.get("/api/analysis", { params });
+  const { data } = await api.get("/api/analysis", { params: { ...params, dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" } });
   return data;
 }
 
 export async function fetchDataRange() {
-  return getCached("/api/data-range", undefined, 30 * 60 * 1000);
+  return getCached("/api/data-range", { dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" }, 30 * 60 * 1000);
+}
+
+export async function fetchDatasetVersions() {
+  return getCached("/api/dataset-versions", undefined, 30 * 60 * 1000);
 }
 
 export async function fetchDirectionRoutes() {
@@ -53,7 +57,7 @@ export async function fetchDirectionRoutes() {
 }
 
 export async function fetchDirectionFlows(params) {
-  return getCached("/api/direction-flows", params);
+  return getCached("/api/direction-flows", { ...params, dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" });
 }
 
 export async function fetchWeather(params) {
@@ -62,19 +66,19 @@ export async function fetchWeather(params) {
 }
 
 export async function fetchPrediction(params) {
-  return getCached("/api/prediction", params, 5 * 60 * 1000);
+  return getCached("/api/prediction", { ...params, dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" }, 5 * 60 * 1000);
 }
 
 export async function fetchPredictionMeta() {
-  return getCached("/api/prediction/meta", undefined, 30 * 60 * 1000);
+  return getCached("/api/prediction/meta", { dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" }, 30 * 60 * 1000);
 }
 
 export async function fetchPredictionOptions() {
-  return getCached("/api/prediction/options", undefined, 30 * 60 * 1000);
+  return getCached("/api/prediction/options", { dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" }, 30 * 60 * 1000);
 }
 
 export async function fetchPredictionCompare(params) {
-  return getCached("/api/prediction/compare", params, 5 * 60 * 1000);
+  return getCached("/api/prediction/compare", { ...params, dataset_version: localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20" }, 5 * 60 * 1000);
 }
 
 export async function postUserAlert(payload) {

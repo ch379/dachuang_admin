@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
-from sqlalchemy import Select, and_, delete, func, select
+from sqlalchemy import Select, and_, delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app.cache import ttl_cache
@@ -17,6 +19,7 @@ from app.schemas import (
     AnalysisPoint,
     DataTimeRange,
     DirectionRoute,
+    DirectionFlow,
     IntersectionPoint,
     PredictionComparePoint,
     PredictionCompareSummary,
@@ -24,11 +27,19 @@ from app.schemas import (
     PredictionRecord,
     RoutePoint,
     TrafficRecord,
+    UserAlert,
+    UserAlertCreate,
     WeatherData,
 )
 from ml.inference import predict_next_hour
 from ml.inference import get_prediction_metadata as load_prediction_metadata
-from ml.dataset import load_prediction_frame
+
+
+_user_alert_lock = Lock()
+_user_alert_seq = 0
+_user_alerts: List[UserAlert] = []
+_USER_ALERT_TTL = timedelta(hours=3)
+_USER_ALERT_MAX = 50
 
 
 def normalize_ts(time_range: Optional[str]) -> Optional[datetime]:
@@ -239,14 +250,9 @@ def load_direction_routes() -> List[DirectionRoute]:
     df = pd.read_excel(xlsx_path, sheet_name="Sheet1", header=None)
     direction_names = {"北向南", "南向北", "东向西", "西向东"}
     routes: List[DirectionRoute] = []
-    anchors = load_route_anchor_map()
-    cardinal_map = load_route_cardinal_map()
-    direction_target = {
-        "北向南": "南",
-        "南向北": "北",
-        "东向西": "西",
-        "西向东": "东",
-    }
+    # Display geometry traced against the current AMap basemap for surveyed roads.
+    override_file = Path(__file__).with_name("map_route_overrides.json")
+    overrides = json.loads(override_file.read_text(encoding="utf-8"))
 
     row_idx = 0
     while row_idx < len(df) - 1:
@@ -255,8 +261,6 @@ def load_direction_routes() -> List[DirectionRoute]:
         if isinstance(site_name_raw, str) and site_name_raw.strip():
             site_name = _normalize_road_name(site_name_raw.strip())
             next_row = df.iloc[row_idx + 1]
-            anchor = anchors.get(site_name or site_name_raw.strip())
-            cardinals = cardinal_map.get(site_name or site_name_raw.strip(), {})
             for col_idx, header in enumerate(row.tolist()):
                 if header not in direction_names:
                     continue
@@ -264,13 +268,8 @@ def load_direction_routes() -> List[DirectionRoute]:
                 if not isinstance(raw_path, str) or not raw_path.strip():
                     continue
                 points = [_parse_point(part.strip()) for part in raw_path.split(";")]
-                clean_points = _clean_path([pt for pt in points if pt is not None])
-                if anchor:
-                    clean_points = _anchor_path(
-                        anchor,
-                        clean_points,
-                        cardinals.get(direction_target.get(header, "")),
-                    )
+                survey_path = overrides.get(site_name, {}).get(header)
+                clean_points = survey_path or _clean_path([pt for pt in points if pt is not None])
                 if len(clean_points) < 2:
                     continue
                 routes.append(
@@ -285,6 +284,52 @@ def load_direction_routes() -> List[DirectionRoute]:
         row_idx += 1
 
     return routes
+
+
+@ttl_cache(seconds=300, maxsize=1)
+def _direction_flow_thresholds() -> Dict[Tuple[str, str], Tuple[float, float]]:
+    # Use fixed historical reference distributions, independent of the window
+    # currently selected in either client. Counts include all turning movements.
+    stmt = select(
+        TrafficData.site_name, TrafficData.approach, TrafficData.timestamp,
+        func.sum(TrafficData.vehicle_count).label("flow"),
+    ).group_by(TrafficData.site_name, TrafficData.approach, TrafficData.timestamp)
+    with SessionLocal() as session:
+        rows = session.execute(stmt).all()
+    if not rows:
+        return {}
+    frame = pd.DataFrame(rows, columns=["site", "direction", "timestamp", "flow"])
+    quantiles = frame.groupby(["site", "direction"])["flow"].quantile([0.5, 0.8]).unstack()
+    return {key: (float(row[0.5]), float(row[0.8])) for key, row in quantiles.iterrows()}
+
+
+def get_direction_flows(db: Session, start_time: str, end_time: str) -> List[DirectionFlow]:
+    start, end = normalize_ts(start_time), normalize_ts(end_time)
+    if start is None or end is None or start >= end:
+        raise ValueError("start_time must be earlier than end_time")
+    buckets = select(
+        TrafficData.site_name.label("site"), TrafficData.approach.label("direction"),
+        TrafficData.timestamp, func.sum(TrafficData.vehicle_count).label("flow"),
+    ).where(TrafficData.timestamp >= start, TrafficData.timestamp < end).group_by(
+        TrafficData.site_name, TrafficData.approach, TrafficData.timestamp,
+    ).subquery()
+    averages = db.execute(select(
+        buckets.c.site, buckets.c.direction, func.avg(buckets.c.flow),
+    ).group_by(buckets.c.site, buckets.c.direction)).all()
+    thresholds = _direction_flow_thresholds()
+    result = []
+    for site, direction, count in averages:
+        medium, high = thresholds[(site, direction)]
+        level = "low"
+        if count > 0 and count >= high:
+            level = "high"
+        elif count > 0 and count >= medium:
+            level = "medium"
+        result.append(DirectionFlow(
+            site_name=site, direction=direction, average_count=count,
+            medium_threshold=medium, high_threshold=high, level=level,
+        ))
+    return result
 
 
 def _apply_filters(
@@ -344,6 +389,93 @@ def get_traffic_data(
 ) -> List[TrafficRecord]:
     road_name = _normalize_road_name(road_name)
     return _get_traffic_data_cached(time_range, start_time, end_time, road_name, direction, limit)
+
+
+_DIRECTION_NAMES = {"E2W": "东向西", "W2E": "西向东", "N2S": "北向南", "S2N": "南向北"}
+
+
+def _version_exists(version: str) -> None:
+    with SessionLocal() as db:
+        found = db.execute(text("SELECT 1 FROM traffic_dataset_version WHERE version_id=:v"), {"v": version}).first()
+    if not found:
+        raise ValueError(f"Unknown dataset version: {version}")
+
+
+def get_versioned_traffic_data(version: str, start_time: Optional[str], end_time: Optional[str],
+                               road_name: Optional[str], direction: Optional[str], limit: int) -> List[TrafficRecord]:
+    _version_exists(version)
+    sql = "SELECT timestamp, site_name, direction, flow_5min, avg_speed_site_kmh, weather, tmax_c, tmin_c FROM traffic_approach_observation WHERE dataset_version=:v"
+    params: dict = {"v": version}
+    if start_time:
+        sql += " AND timestamp >= :start"; params["start"] = normalize_ts(start_time).isoformat(sep=" ")
+    if end_time:
+        sql += " AND timestamp <= :end"; params["end"] = normalize_ts(end_time).isoformat(sep=" ")
+    if road_name:
+        sql += " AND site_name=:site"; params["site"] = _normalize_road_name(road_name)
+    if direction:
+        sql += " AND direction=:direction"; params["direction"] = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
+    sql += " ORDER BY timestamp DESC LIMIT :limit"; params["limit"] = limit
+    with SessionLocal() as db:
+        rows = db.execute(text(sql), params).mappings().all()
+    return [TrafficRecord(timestamp=r["timestamp"], site_name=r["site_name"], approach=_DIRECTION_NAMES.get(r["direction"], r["direction"]), movement="方向汇总", vehicle_count=max(0, int(r["flow_5min"] or 0)), avg_speed=max(0, float(r["avg_speed_site_kmh"] or 0)), weather=r["weather"] or "未知", tmax=int(r["tmax_c"] or 0), tmin=int(r["tmin_c"] or 0)) for r in rows]
+
+
+def get_versioned_analysis_data(version: str, start_time: str, end_time: str, interval_minutes: int,
+                                road_name: Optional[str], direction: Optional[str]) -> List[AnalysisPoint]:
+    _version_exists(version)
+    start_ts, end_ts = normalize_ts(start_time), normalize_ts(end_time)
+    allowed = (10, 20, 30, 60, 120, 180, 240, 360, 720, 1440)
+    if not start_ts or not end_ts or end_ts < start_ts or interval_minutes not in allowed:
+        raise ValueError("Invalid time range or interval")
+    sql = "SELECT timestamp, flow_5min, avg_speed_site_kmh FROM traffic_approach_observation WHERE dataset_version=:v AND timestamp>=:start AND timestamp<=:end AND data_valid_flag=1"
+    params: dict = {"v": version, "start": start_ts.isoformat(sep=" "), "end": end_ts.isoformat(sep=" ")}
+    if road_name:
+        sql += " AND site_name=:site"; params["site"] = _normalize_road_name(road_name)
+    if direction:
+        sql += " AND direction=:direction"; params["direction"] = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
+    with SessionLocal() as db:
+        rows = db.execute(text(sql), params).mappings().all()
+    grouped: Dict[datetime, List[Tuple[float, float]]] = {}
+    for r in rows:
+        ts = datetime.fromisoformat(r["timestamp"])
+        bucket = start_ts + timedelta(minutes=(int((ts-start_ts).total_seconds()//60)//interval_minutes)*interval_minutes)
+        grouped.setdefault(bucket.replace(second=0,microsecond=0), []).append((float(r["flow_5min"] or 0), float(r["avg_speed_site_kmh"] or 0)))
+    return [AnalysisPoint(bucket_start=b, vehicle_count=round(sum(x[0] for x in vals)/len(vals),2), avg_speed=round(sum(x[1] for x in vals)/len(vals),2)) for b,vals in sorted(grouped.items())]
+
+
+def get_versioned_data_range(version: str) -> DataTimeRange:
+    _version_exists(version)
+    with SessionLocal() as db:
+        row = db.execute(text("SELECT MIN(timestamp), MAX(timestamp) FROM traffic_approach_observation WHERE dataset_version=:v"), {"v":version}).first()
+    if not row or not row[0] or not row[1]:
+        raise ValueError("No traffic data found for version")
+    return DataTimeRange(min_timestamp=row[0], max_timestamp=row[1])
+
+
+def get_versioned_direction_flows(version: str, start_time: str, end_time: str) -> List[DirectionFlow]:
+    _version_exists(version)
+    start, end = normalize_ts(start_time), normalize_ts(end_time)
+    if start is None or end is None or start >= end:
+        raise ValueError("start_time must be earlier than end_time")
+    with SessionLocal() as db:
+        rows = db.execute(text(
+            "SELECT site_name, direction, timestamp, flow_5min FROM traffic_approach_observation "
+            "WHERE dataset_version=:v AND data_valid_flag=1"
+        ), {"v": version}).mappings().all()
+    if not rows:
+        return []
+    frame = pd.DataFrame(rows)
+    quantiles = frame.groupby(["site_name", "direction"])["flow_5min"].quantile([0.5, 0.8]).unstack()
+    selected = frame[(frame["timestamp"] >= start.isoformat(sep=" ")) & (frame["timestamp"] < end.isoformat(sep=" "))]
+    averages = selected.groupby(["site_name", "direction"])["flow_5min"].mean()
+    result = []
+    for (site, direction), count in averages.items():
+        if (site, direction) not in quantiles.index:
+            continue
+        medium, high = float(quantiles.loc[(site, direction), 0.5]), float(quantiles.loc[(site, direction), 0.8])
+        level = "high" if count >= high and count > 0 else "medium" if count >= medium and count > 0 else "low"
+        result.append(DirectionFlow(site_name=site, direction=_DIRECTION_NAMES.get(direction, direction), average_count=float(count), medium_threshold=medium, high_threshold=high, level=level))
+    return result
 
 
 @ttl_cache(seconds=300, maxsize=512)
@@ -431,6 +563,43 @@ def get_prediction_data(
     ]
 
 
+def get_versioned_prediction_data(version: str, time_range: Optional[str], road_name: Optional[str], direction: Optional[str]) -> List[PredictionRecord]:
+    from ml.versioned_inference import predict_versioned
+    _version_exists(version)
+    ts = align_to_ten_minutes_floor(normalize_ts(time_range))
+    site = _normalize_road_name(road_name)
+    if not site or not direction:
+        raise ValueError("road_name and direction are required for prediction.")
+    code = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
+    predicted = predict_versioned(version, site, code, ts.strftime("%Y-%m-%d %H:%M:%S") if ts else None)
+    return [PredictionRecord(timestamp=t, site_name=site, approach=direction, predicted_vehicle_count=n) for t,n in predicted]
+
+
+def get_versioned_prediction_compare(version: str, time_range: str, road_name: str, direction: str) -> PredictionCompareSummary:
+    predicted = get_versioned_prediction_data(version, time_range, road_name, direction)
+    if not predicted:
+        raise ValueError("Prediction model is not ready or no history is available for this road and direction.")
+    code = next((k for k, v in _DIRECTION_NAMES.items() if v == direction), direction)
+    with SessionLocal() as db:
+        rows = db.execute(text(
+            "SELECT timestamp, flow_5min FROM traffic_approach_observation WHERE dataset_version=:v "
+            "AND site_name=:site AND direction=:direction AND data_valid_flag=1 "
+            "AND timestamp>=:start AND timestamp<=:end"
+        ), {"v":version, "site":_normalize_road_name(road_name), "direction":code,
+            "start":predicted[0].timestamp.strftime("%Y-%m-%d %H:%M:%S"), "end":predicted[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S")}).mappings().all()
+    actual = {datetime.fromisoformat(r["timestamp"]): int(r["flow_5min"] or 0) for r in rows}
+    points=[]; errors=[]; sq=[]; ape=[]
+    for p in predicted:
+        if p.timestamp not in actual:
+            continue
+        err=abs(p.predicted_vehicle_count-actual[p.timestamp]); errors.append(err); sq.append(err**2)
+        if actual[p.timestamp]: ape.append(err/actual[p.timestamp]*100)
+        points.append(PredictionComparePoint(timestamp=p.timestamp, predicted_vehicle_count=p.predicted_vehicle_count, actual_vehicle_count=actual[p.timestamp], abs_error=err))
+    if not points:
+        raise ValueError("No actual observations overlap the prediction horizon.")
+    return PredictionCompareSummary(mae=sum(errors)/len(errors), rmse=(sum(sq)/len(sq))**0.5, mape=sum(ape)/len(ape) if ape else 0, points=points)
+
+
 @ttl_cache(seconds=300, maxsize=512)
 def _get_prediction_data_cached(
     road_name: str,
@@ -499,7 +668,8 @@ def _find_prediction_result_rows(
     if not rows:
         return []
     expected_start = as_of.replace(second=0, microsecond=0)
-    if rows[0].target_time != expected_start:
+    expected_next = expected_start + timedelta(minutes=10)
+    if rows[0].target_time not in {expected_start, expected_next}:
         return []
     return [(row.target_time, row.predicted_vehicle_count) for row in rows]
 
@@ -543,6 +713,19 @@ def get_prediction_meta() -> dict:
 
 def list_prediction_options(db: Session) -> List[PredictionOption]:
     return _list_prediction_options_cached()
+
+
+def list_versioned_prediction_options(version: str) -> List[PredictionOption]:
+    _version_exists(version)
+    with SessionLocal() as db:
+        rows = db.execute(text(
+            "SELECT DISTINCT site_name, direction FROM traffic_approach_observation "
+            "WHERE dataset_version=:v ORDER BY site_name, direction"
+        ), {"v":version}).all()
+    grouped: Dict[str, List[str]] = {}
+    for site, direction in rows:
+        grouped.setdefault(site, []).append(_DIRECTION_NAMES.get(direction, direction))
+    return [PredictionOption(site_name=site, directions=directions) for site,directions in grouped.items()]
 
 
 @ttl_cache(seconds=1800, maxsize=1)
@@ -632,27 +815,39 @@ def _get_prediction_actuals_cached(
 ) -> Dict[datetime, int]:
     start_ts = datetime.strptime(start_key, "%Y-%m-%d %H:%M:%S")
     end_ts = datetime.strptime(end_key, "%Y-%m-%d %H:%M:%S")
-    frame = load_prediction_frame(site_name=road_name, approach=direction)
-    if frame.empty:
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(TrafficData)
+            .where(
+                TrafficData.site_name == road_name,
+                TrafficData.approach == direction,
+                TrafficData.timestamp >= start_ts,
+                TrafficData.timestamp <= end_ts,
+            )
+            .order_by(TrafficData.timestamp.asc())
+        ).scalars().all()
+    finally:
+        db.close()
+
+    if not rows:
         return {}
-    window = frame[(frame["timestamp"] >= start_ts) & (frame["timestamp"] <= end_ts)].copy()
-    if window.empty:
-        return {}
-    rows = [
+
+    normalized_rows = [
         TrafficRecord(
-            timestamp=row.timestamp.to_pydatetime() if hasattr(row.timestamp, "to_pydatetime") else row.timestamp,
+            timestamp=row.timestamp,
             site_name=row.site_name,
             approach=row.approach,
-            movement="",
+            movement=row.movement,
             vehicle_count=int(row.vehicle_count),
             avg_speed=float(row.avg_speed),
             weather=str(row.weather),
-            tmax=int(round(row.tmax)),
-            tmin=int(round(row.tmin)),
+            tmax=int(row.tmax),
+            tmin=int(row.tmin),
         )
-        for row in window.itertuples(index=False)
+        for row in rows
     ]
-    return _aggregate_actual_prediction_window(rows, start_ts)
+    return _aggregate_actual_prediction_window(normalized_rows, start_ts)
 
 
 def _aggregate_actual_prediction_window(rows: List[TrafficRecord], anchor_time: datetime) -> Dict[datetime, int]:
@@ -776,3 +971,39 @@ def _get_data_time_range_cached() -> DataTimeRange:
 
 def get_direction_routes() -> List[DirectionRoute]:
     return load_direction_routes()
+
+
+def _cleanup_user_alerts(now: Optional[datetime] = None) -> None:
+    current = now or datetime.utcnow()
+    threshold = current - _USER_ALERT_TTL
+    _user_alerts[:] = [item for item in _user_alerts if item.created_at >= threshold]
+    if len(_user_alerts) > _USER_ALERT_MAX:
+        del _user_alerts[:-_USER_ALERT_MAX]
+
+
+def create_user_alert(payload: UserAlertCreate) -> UserAlert:
+    global _user_alert_seq
+
+    with _user_alert_lock:
+        _cleanup_user_alerts()
+        _user_alert_seq += 1
+        alert = UserAlert(
+            id=_user_alert_seq,
+            source=payload.source,
+            title=payload.title,
+            message=payload.message,
+            site_name=payload.site_name,
+            direction=payload.direction,
+            start_time=payload.start_time,
+            end_time=payload.end_time,
+            action_label=payload.action_label,
+            created_at=datetime.utcnow(),
+        )
+        _user_alerts.append(alert)
+        return alert
+
+
+def list_user_alerts(after_id: int = 0) -> List[UserAlert]:
+    with _user_alert_lock:
+        _cleanup_user_alerts()
+        return [item for item in _user_alerts if item.id > after_id]

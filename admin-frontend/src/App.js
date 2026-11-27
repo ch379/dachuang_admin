@@ -19,6 +19,7 @@ import {
 import {
   fetchAnalysis,
   fetchDataRange,
+  fetchDatasetVersions,
   fetchDirectionRoutes,
   fetchDirectionFlows,
   fetchPrediction,
@@ -255,6 +256,8 @@ function App() {
   const [pickerMonth, setPickerMonth] = useState("2025-09");
   const [siteDirections, setSiteDirections] = useState({});
   const [selectedSite, setSelectedSite] = useState("");
+  const [datasetVersions, setDatasetVersions] = useState([]);
+  const [datasetVersion, setDatasetVersion] = useState(localStorage.getItem("trafficDatasetVersion") || "新版_20260811_排除S20");
   const [trafficRows, setTrafficRows] = useState([]);
   const [predictionRows, setPredictionRows] = useState([]);
   const [predictionCompare, setPredictionCompare] = useState(null);
@@ -287,12 +290,13 @@ function App() {
       setLoading(true);
       setError("");
       try {
-        const [config, range, routeData, options, meta] = await Promise.all([
+        const [config, range, routeData, options, meta, versions] = await Promise.all([
           fetchPublicConfig(),
           fetchDataRange(),
           fetchDirectionRoutes(),
           fetchPredictionOptions(),
           fetchPredictionMeta(),
+          fetchDatasetVersions(),
         ]);
 
         const min = toInputTime(range.min_timestamp);
@@ -308,6 +312,7 @@ function App() {
         setRoutes(routeData || []);
         setPredictionOptions(options || []);
         setPredictionMeta(meta);
+        setDatasetVersions(versions || []);
         setTimeLimit({ min, max });
         setStartInput(initialRange.start);
         setEndInput(initialRange.end);
@@ -789,6 +794,12 @@ function App() {
       </header>
 
       <section className="top-control-row">
+        <label className="dataset-version-control" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span>数据版本</span>
+          <select value={datasetVersion} onChange={(event) => { const value = event.target.value; setDatasetVersion(value); localStorage.setItem("trafficDatasetVersion", value); window.location.reload(); }}>
+            {datasetVersions.map((item) => <option key={item.version_id} value={item.version_id}>{item.display_name}</option>)}
+          </select>
+        </label>
         <div className="road-cards">
           {siteStats.map((item) => (
             <div

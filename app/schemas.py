@@ -93,3 +93,36 @@ class DirectionRoute(BaseModel):
     site_name: str
     direction: str
     path: List[RoutePoint]
+
+
+class DirectionFlow(BaseModel):
+    site_name: str
+    direction: str
+    average_count: float = Field(ge=0)
+    medium_threshold: float = Field(ge=0)
+    high_threshold: float = Field(ge=0)
+    level: str
+
+
+class UserAlertCreate(BaseModel):
+    source: str = "admin"
+    title: str
+    message: str
+    site_name: Optional[str] = None
+    direction: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    action_label: Optional[str] = None
+
+
+class UserAlert(BaseModel):
+    id: int
+    source: str = "admin"
+    title: str
+    message: str
+    site_name: Optional[str] = None
+    direction: Optional[str] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    action_label: Optional[str] = None
+    created_at: datetime
